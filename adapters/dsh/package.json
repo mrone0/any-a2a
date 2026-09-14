@@ -1,0 +1,24 @@
+{
+  "name": "@any-a2a/dsh",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-shot any-a2a subagent provider for the pinned DeepSeek Harness API",
+  "type": "module",
+  "engines": { "node": "^22.19.0 || >=24" },
+  "exports": { ".": { "types": "./src/index.d.ts", "default": "./src/index.js" }, "./package.json": "./package.json" },
+  "files": ["src", "cordis.patch.yml", "README.md"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-subagent": "0.1.5-rc.2"
+  },
+  "devDependencies": {
+    "jsonc-parser": "3.3.1",
+    "tsx": "4.22.4",
+    "zod": "4.6.5"
+  },
+  "scripts": {
+    "test": "node --test tests/provider.test.mjs",
+    "test:dsh": "node --import ./tests/dsh-loader.mjs --test tests/integration.test.mjs"
+  }
+}

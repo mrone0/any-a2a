@@ -1,0 +1,20 @@
+[package]
+name = "any-a2a"
+version = "0.1.0"
+edition = "2024"
+description = "Small A2A client with a DeepSeek Harness subagent provider"
+license = "MIT"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tiny_http = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

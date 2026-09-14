@@ -1,0 +1,8 @@
+# Host provider only; grant the one-shot tool independently in an Agent Preset.
+- insert:
+    - id: subagent-any-a2a
+      name: '@any-a2a/dsh'
+      config:
+        serviceUrl: !!js process.env.ANY_A2A_SERVICE_URL
+        serviceToken: !!js process.env.ANY_A2A_SERVICE_TOKEN
+        agentId: !!js process.env.ANY_A2A_AGENT_ID

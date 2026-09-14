@@ -1,0 +1,1 @@
+{"name":"any-a2a-desktop","private":true,"scripts":{"tauri":"tauri"},"devDependencies":{"@tauri-apps/cli":"^2"},"dependencies":{"@tauri-apps/api":"^2"}}

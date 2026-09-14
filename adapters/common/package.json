@@ -1,0 +1,8 @@
+{
+  "name": "@any-a2a/common",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { "./service-client": "./src/service-client.js" },
+  "files": ["src"]
+}

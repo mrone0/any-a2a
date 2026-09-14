@@ -1,0 +1,9 @@
+/target/
+/.research/
+.DS_Store
+.idea/
+node_modules/
+.env
+/desktop/src-tauri/target/
+
+adapters/dsh/.npm-cache/
