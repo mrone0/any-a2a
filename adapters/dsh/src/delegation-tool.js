@@ -1,5 +1,6 @@
 /** DSH-native one-shot delegation; omitted background flag means background. */
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { observeProgress } from './progress.js'
 import { openRemoteSession } from './remote-session.js'
 export const name = 'any-a2a-delegation-tool'
 export const inject = ['tools', 'subagents', 'jobs', 'sessions', 'sessionProjections']
@@ -31,18 +32,19 @@ export function apply(ctx, config) {
       if (!ctx.subagents.getProvider(config.provider)) throw Error('Remote subagent provider unavailable')
       const request = {label:args.description,parent:exec.agent,prompt:[{type:'text',text:args.prompt}]}
       const transcript = openRemoteSession(ctx, exec.agent, `${config.toolName}: ${args.description}`, request.prompt, config.provider)
-      const settleRecorded = async (start) => {
+      const settleRecorded = async (signal) => {
+        const unobserve = observeProgress(signal, event => transcript.progress(event))
         try {
-          const result = await settle(start)
+          const result = await settle(ctx.subagents.start(config.provider,{...request,signal}))
           transcript.close(result)
           return result
         } catch (error) {
           transcript.close({output:[],stopReason:'error'})
           throw error
-        }
+        } finally { unobserve() }
       }
       if (args.run_in_background === false) {
-        const result = await settleRecorded(ctx.subagents.start(config.provider,{...request,signal:exec.signal}))
+        const result = await settleRecorded(exec.signal)
         return {kind:'foreground',sessionId:transcript.id,output:result.output,stopReason:result.stopReason}
       }
       let jobId
@@ -52,7 +54,11 @@ export function apply(ctx, config) {
           const controller = new AbortController()
           return {
             cancel: () => controller.abort(),
-            done: settleRecorded(ctx.subagents.start(config.provider,{...request,signal:controller.signal})),
+            done: settleRecorded(controller.signal).then(result => ({
+              status: result.stopReason === 'completed' ? 'completed' : result.stopReason === 'aborted' ? 'killed' : 'failed',
+              detail: result.stopReason,
+              output: result.output.filter(block => block.type === 'text').map(block => block.text).join('\n'),
+            })),
           }
         },
       }) } catch (error) { transcript.close({output:[],stopReason:'error'}); throw error }

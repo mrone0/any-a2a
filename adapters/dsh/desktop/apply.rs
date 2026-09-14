@@ -18,6 +18,12 @@ pub async fn apply_dsh(connection: tauri::State<'_, crate::Connection>, path: St
     let mut patches: Vec<Value> = serde_json::from_str(body).map_err(|_| "只支持 JSON 数组或 DSH 默认空配置；不解析通用 YAML，请使用独立 JSON overlay")?;
     if original.contains("any-a2a-app-") { return Err("已存在 any-a2a 配置，请先核对已有配置，避免重复写入".into()) }
     let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters/dsh/src/index.js").canonicalize().map_err(|_| "Adapter source missing")?;
+    let executable = std::env::var_os("ANY_A2A_EXECUTABLE").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX))
+    }).canonicalize().map_err(|_| "CLI 不存在，请先 cargo build 或设置 ANY_A2A_EXECUTABLE 为绝对路径")?;
+    let data_dir = any_a2a::catalog::data_dir()?.canonicalize().map_err(|_| "Cannot resolve catalog directory")?;
+    let adapter_url = reqwest::Url::from_file_path(&adapter).map_err(|_| "Cannot convert adapter path to file URL")?.to_string();
+    let tool_url = reqwest::Url::from_file_path(adapter.with_file_name("delegation-tool.js")).map_err(|_| "Cannot convert tool path to file URL")?.to_string();
     let mut rows = vec![];
     let mut tools = vec![];
     for (index, agent) in agents.iter().enumerate() {
@@ -27,8 +33,8 @@ pub async fn apply_dsh(connection: tauri::State<'_, crate::Connection>, path: St
         let normalized: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).take(48).collect();
         let mut tool = if normalized.trim_matches('_').is_empty() { format!("remote_agent_{}", index+1) } else { normalized };
         if tools.contains(&tool) { tool = format!("{tool}_{}", index+1); }
-        rows.push(json!({"id":provider,"name":adapter,"config":{"serviceUrl":format!("http://{}",connection.address),"serviceToken":connection.token,"agentId":id,"providerName":provider,"toolName":tool}}));
-        rows.push(json!({"id":format!("{provider}-tool"),"name":adapter.with_file_name("delegation-tool.js"),"config":{"provider":provider,"toolName":tool,"backgroundMode":"one-shot","maxDepth":"provider-managed","enableRunInBackground":true,"modelSelectionSettings":false}}));
+        rows.push(json!({"id":provider,"name":adapter_url,"config":{"executable":executable,"dataDir":data_dir,"agentId":id,"providerName":provider,"toolName":tool}}));
+        rows.push(json!({"id":format!("{provider}-tool"),"name":tool_url,"config":{"provider":provider,"toolName":tool,"backgroundMode":"one-shot","maxDepth":"provider-managed","enableRunInBackground":true,"modelSelectionSettings":false}}));
         tools.push(tool);
     }
     patches.push(json!({"insert":rows}));
@@ -39,5 +45,5 @@ pub async fn apply_dsh(connection: tauri::State<'_, crate::Connection>, path: St
     out.write_all(original.as_bytes()).and_then(|_|out.sync_all()).map_err(|_| "Cannot persist backup")?;
     if fs::read_to_string(file).map_err(|_| "Cannot recheck patch")? != original { return Err("配置已改变，请重试".into()); }
     any_a2a::catalog::atomic_write(file, serde_json::to_string_pretty(&patches).unwrap().as_bytes())?;
-    Ok(json!({"configured":true,"activated":false,"backup":backup,"tools":tools,"message":"Provider 和工具行已写入。Web preset 授权尚未自动配置；重启 pnpm dsh web 后仍需验证工具可见性。当前地址/token 仅本次 App 会话有效，重启 App 后需更新配置。"}))
+    Ok(json!({"configured":true,"activated":false,"backup":backup,"tools":tools,"message":"Provider 和工具行已写入。Web preset 授权尚未自动配置；重启 pnpm dsh web 后仍需验证工具可见性。客户端直接启动 CLI，关闭桌面 App 不影响客户端委派。请保持 CLI、适配器及本地目录路径有效。"}))
 }

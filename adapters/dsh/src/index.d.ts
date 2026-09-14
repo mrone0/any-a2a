@@ -9,7 +9,10 @@ export interface Config {
   cardFile?: string
   serviceUrl?: string
   serviceToken?: string
+  /** Saved catalog agent; without serviceUrl uses a client-owned CLI process. */
   agentId?: string
+  /** Absolute local catalog directory; defaults to the CLI's platform data directory. */
+  dataDir?: string
   /** Native delegation tool bound to this provider; enables live capability hints. */
   toolName?: string
   /** Local any-a2a service mode; mutually exclusive with cardUrl/cardFile. */

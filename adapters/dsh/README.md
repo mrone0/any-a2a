@@ -2,6 +2,37 @@
 
 One-shot **subagent provider**, not an LLM provider, implemented against cloned DeepSeek Harness HEAD `c291e7961a515f6d7af9304e7fd1d257929aef26` (package version `0.1.5-rc.2`). DSH's APIs are pre-stable; other revisions are not verified.
 
+## Desktop-managed, client-owned execution (default)
+
+New desktop-generated DSH configurations use `agentId`, `dataDir` (absolute catalog directory), and `executable` (absolute native CLI path). DSH owns each CLI process:
+
+```text
+DSH -> any-a2a run --agent-id ID -> remote A2A Agent
+```
+
+The desktop app is not in this execution path. Closing it or its private service does not interrupt DSH calls. The CLI reads the selected saved agent and its authentication for each invocation; credentials are not copied into the DSH patch. Capability hints refresh through `any-a2a catalog`, whose output omits stored authentication fields. Treat catalog metadata as private, untrusted data nonetheless.
+
+Keep the executable, adapter source, and catalog paths valid and readable by the DSH user. Rebuild the CLI before applying new configurations. Moving the checkout requires updating paths. No background daemon or GUI autostart is required.
+
+Existing `serviceUrl`/`serviceToken` configurations remain compatible but still depend on that service. They are **not migrated automatically**: back up your DSH patch, remove only the old any-a2a-owned provider/tool entries, then apply again from the app and restart DSH. Do not delete unrelated configuration. Existing DSH preset permissions still need verification.
+
+Client abort/dispose currently stops local CLI execution only, **not remote A2A work**. The desktop's cancel button applies only to its own test runs; cross-client task management and task recovery are not implemented. Complete remote result objects are preserved as JSON text in CLI-backed DSH results when available.
+
+Validation on Windows: `cargo build` then `node --test adapters/dsh/tests/catalog-cli.test.mjs` exercises the native CLI, catalog auth, structured results, capability refresh, and deleted agents without any desktop service. Legacy provider tests use executable `.mjs` fixtures that Windows cannot spawn directly (`EFTYPE`).
+
+## Session observability
+
+Catalog CLI mode uses `run --agent-id ID --events`: stdout is bounded NDJSON progress plus one final result. The custom `delegation-tool.js` records a parent-linked child session with the submitted prompt, protocol requests/responses, task status changes, final text/raw result, and elapsed time. It does not fabricate remote reasoning or internal tool calls. Protocol origin, headers, tokens, and request payloads are not copied into progress messages; the delegated prompt and remote output are intentionally persisted and may be sensitive. The CLI and adapter must be updated together. Direct cardUrl/cardFile and legacy service modes still return final results without live progress.
+
+Use the custom delegation tool rather than the stock DSH subagent tool for these child transcripts. Background results are translated into DSH `JobOutcome` (`status`, `detail`, string `output`) before `job_output` collects them. Descriptor version is imported from the installed DSH package instead of hardcoded.
+
+Local Windows validation against DSH `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`: real headless model foreground delegation and default-background + job_output both returned A2A-DEMO-OK. The persisted foreground child transcript was decoded and checked for input, requests, working/completed states, output, and turn closure. This is not browser/UI validation or remote internal-reasoning support.
+
+```sh
+cargo test --target-dir target/demo-build
+DSH_TEST_ROOT=D:/code/deepseek-harness node --import ./adapters/dsh/tests/local-dsh-loader.mjs --test adapters/dsh/tests/remote-session.test.mjs adapters/dsh/tests/delegation.test.mjs
+```
+
 ## Install and compose
 
 This standalone ESM package requires no build. Its named `name`, `inject`, and `apply` exports preserve Cordis loader metadata; there is deliberately no default export. Configuration is validated in `apply`, not by an exported Schemastery schema. Registration calls the real effect-scoped `ctx.subagents.registerProvider`; unloading prevents new runs but does not revoke already published runs. Callers own and must dispose those runs.
@@ -34,7 +65,10 @@ For explicit composition the plugin config accepts:
 
 | Field | Meaning |
 | --- | --- |
-| `cardUrl` | Required HTTP(S) card URL, no userinfo. |
+| `cardUrl` | HTTP(S) card URL, no userinfo; choose exactly one of cardUrl, cardFile, or agentId for CLI mode. |
+| `cardFile` | Absolute raw Agent Card JSON file path. |
+| `agentId` | Saved local catalog Agent ID. |
+| `dataDir` | Absolute catalog directory for CLI mode; optional platform default. |
 | `providerName` | Registry name, default `any-a2a`; use distinct names for multiple cards. |
 | `executable` | Executable path or PATH name, default `any-a2a`; not a shell command. |
 | `maxOutputBytes` | Positive safe integer; stdout buffer ceiling, default 1 MiB. |

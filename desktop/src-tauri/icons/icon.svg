@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#202D48"/><stop offset="1" stop-color="#0C1224"/></linearGradient>
+    <linearGradient id="flow" x2="1" y2="1"><stop stop-color="#8DDFFF"/><stop offset="1" stop-color="#B4A0FF"/></linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="18" y="18" width="476" height="476" rx="110" fill="none" stroke="#3B4865" stroke-width="2"/>
+  <!-- Two equal peers, two directed message routes. No central coordinator. -->
+  <g fill="none" stroke="url(#flow)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M146 212V184Q146 146 184 146H328M304 122L330 146L304 170"/>
+    <path d="M366 300V328Q366 366 328 366H184M208 342L182 366L208 390"/>
+  </g>
+  <path d="M146 196L198 226V286L146 316L94 286V226Z" fill="#8DDFFF"/>
+  <path d="M366 196L418 226V286L366 316L314 286V226Z" fill="#B4A0FF"/>
+  <g fill="none" stroke="#152039" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M127 277L146 235L165 277M135 262H157"/>
+    <path d="M347 277L366 235L385 277M355 262H377"/>
+  </g>
+</svg>

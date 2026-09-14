@@ -11,7 +11,15 @@ fn run() -> Result<(), String> {
     match args.next().as_deref() {
         Some("--help" | "-h") | None => {
             println!(
-                "any-a2a run (--card URL | --card-file PATH) --message TEXT [--timeout-secs 120]\nA2A JSON-RPC client. Optional bearer token: ANY_A2A_TOKEN.\nTimeout or local termination does not cancel remote work."
+                "any-a2a run (--agent-id ID | --card URL | --card-file PATH) --message TEXT [--timeout-secs 120]\nA2A JSON-RPC client. Optional bearer token: ANY_A2A_TOKEN.\nTimeout or local termination does not cancel remote work."
+            );
+            return Ok(());
+        }
+        Some("catalog") => {
+            println!(
+                "{}",
+                serde_json::to_string(&any_a2a::catalog::list_agents()?)
+                    .map_err(|_| "Cannot serialize catalog")?
             );
             return Ok(());
         }
@@ -19,12 +27,16 @@ fn run() -> Result<(), String> {
         Some("run") => {}
         _ => return Err("Expected run; see --help".into()),
     }
+    let mut events = false;
+    let mut agent_id = None;
     let (mut card, mut card_file, mut message, mut timeout) = (None, None, None, 120u64);
     while let Some(flag) = args.next() {
+        if flag == "--events" { events = true; any_a2a::enable_trace_stream(); continue; }
         let value = args
             .next()
             .ok_or_else(|| format!("Missing value for {flag}"))?;
         match flag.as_str() {
+            "--agent-id" => agent_id = Some(value),
             "--card" => card = Some(value),
             "--card-file" => card_file = Some(value),
             "--message" => message = Some(value),
@@ -40,25 +52,46 @@ fn run() -> Result<(), String> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let duration = Duration::from_secs(timeout);
-    let mut client = match (card, card_file) {
-        (Some(url), None) => any_a2a::A2aClient::connect(&url, token, duration)?,
-        (None, Some(path)) => {
-            let file = std::fs::File::open(path).map_err(|_| "Cannot open local Agent Card")?;
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            file.take(4 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| "Cannot read Agent Card")?;
-            if bytes.len() > 4 * 1024 * 1024 {
-                return Err("Agent Card too large".into());
-            }
-            let card =
-                serde_json::from_slice(&bytes).map_err(|_| "Invalid local Agent Card JSON")?;
-            any_a2a::A2aClient::connect_card(&card, token, duration)?
+    let mut client = if let Some(id) = agent_id {
+        if card.is_some() || card_file.is_some() {
+            return Err("--agent-id is mutually exclusive with --card/--card-file".into());
         }
-        _ => return Err("Specify exactly one of --card or --card-file".into()),
+        let agent = any_a2a::catalog::get_agent(&id)?;
+        if agent.source == "url" {
+            any_a2a::A2aClient::connect_authenticated(
+                agent.card_url.as_deref().ok_or("Missing card URL")?,
+                None,
+                duration,
+                &agent.auth,
+            )?
+        } else {
+            any_a2a::A2aClient::connect_card_authenticated(&agent.raw, None, duration, &agent.auth)?
+        }
+    } else {
+        match (card, card_file) {
+            (Some(url), None) => any_a2a::A2aClient::connect(&url, token, duration)?,
+            (None, Some(path)) => {
+                let file = std::fs::File::open(path).map_err(|_| "Cannot open local Agent Card")?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.take(4 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| "Cannot read Agent Card")?;
+                if bytes.len() > 4 * 1024 * 1024 {
+                    return Err("Agent Card too large".into());
+                }
+                let card =
+                    serde_json::from_slice(&bytes).map_err(|_| "Invalid local Agent Card JSON")?;
+                any_a2a::A2aClient::connect_card(&card, token, duration)?
+            }
+            _ => return Err("Specify exactly one of --agent-id, --card or --card-file".into()),
+        }
     };
     let result = client.run(&message)?;
+    if events {
+        println!("{}", serde_json::json!({"event":"result","data":result}));
+        return Ok(());
+    }
     println!(
         "{}",
         serde_json::to_string(&result).map_err(|_| "Result serialization failed")?

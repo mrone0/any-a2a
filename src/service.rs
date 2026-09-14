@@ -4,7 +4,11 @@ use crate::{A2aClient, Result};
 use serde_json::{Value, json};
 use std::{io::Read, time::Duration};
 
-fn dispatch(method: &str, path: &str, value: Value) -> Result<Value> {
+type Runs = std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+>;
+
+fn dispatch(method: &str, path: &str, value: Value, runs: &Runs) -> Result<Value> {
     match (method, path) {
         ("GET", "/api/cards") => Ok(json!(list_agents()?)),
         ("POST", "/api/cards") => {
@@ -52,6 +56,15 @@ fn dispatch(method: &str, path: &str, value: Value) -> Result<Value> {
             crate::catalog::delete_agent(value["id"].as_str().ok_or("Missing agent id")?)?;
             Ok(json!({"deleted":true}))
         }
+        ("POST", "/api/cancel") => {
+            let id = value["runId"].as_str().ok_or("missing runId")?;
+            let runs = runs.lock().map_err(|_| "Run lock poisoned")?;
+            let flag = runs.get(id).ok_or("运行不存在或已结束；未发送取消请求")?;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(
+                json!({"requested":true,"message":"已请求取消；等待当前请求返回并取得任务 ID 后发送远端取消，尚未确认"}),
+            )
+        }
         ("POST", "/api/run") => {
             let id = value["id"].as_str().ok_or("missing id")?;
             let message = value["message"].as_str().ok_or("missing message")?;
@@ -74,15 +87,30 @@ fn dispatch(method: &str, path: &str, value: Value) -> Result<Value> {
                     &agent.auth,
                 )?
             };
-            Ok(json!(
-                client.run_with_configuration(
-                    message,
-                    value
-                        .get("configuration")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}))
-                )?
-            ))
+            let run_id = value["runId"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let mut active = runs.lock().map_err(|_| "Run lock poisoned")?;
+                if active.contains_key(&run_id) {
+                    return Err("Duplicate runId".into());
+                }
+                active.insert(run_id.clone(), flag.clone());
+            }
+            let result = client.run_cancellable(
+                message,
+                value
+                    .get("configuration")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                &flag,
+            );
+            runs.lock()
+                .map_err(|_| "Run lock poisoned")?
+                .remove(&run_id);
+            Ok(json!(result?))
         }
         _ => Err("not found".into()),
     }
@@ -95,59 +123,82 @@ pub fn serve() -> Result<()> {
         .ok_or("ANY_A2A_SERVICE_TOKEN is required")?;
     let server = tiny_http::Server::http("127.0.0.1:0").map_err(|_| "Cannot bind local service")?;
     println!("{}", server.server_addr());
-    for mut request in server.incoming_requests() {
-        let authorized = request.headers().iter().any(|h| {
-            h.field.equiv("Authorization") && h.value.as_str() == format!("Bearer {token}")
-        });
-        let (status, value) = if !authorized {
-            (401, json!({"error":"unauthorized"}))
-        } else {
-            let mut bytes = Vec::new();
-            let read = request
-                .as_reader()
-                .take(4 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes);
-            if read.is_err() || bytes.len() > 4 * 1024 * 1024 {
-                (413, json!({"error":"request too large or unreadable"}))
-            } else {
-                let body = if bytes.is_empty() {
-                    Ok(json!({}))
-                } else {
-                    serde_json::from_slice(&bytes)
-                };
-                match body {
-                    Err(_) => (400, json!({"error":"invalid JSON"})),
-                    Ok(body) => {
-                        crate::take_request_trace();
-                        let started = std::time::Instant::now();
-                        let result = dispatch(request.method().as_str(), request.url(), body);
-                        let trace = crate::take_request_trace();
-                        let (status, mut value) = match result {
-                            Ok(value) => (200, value),
-                            Err(error) => (400, json!({"error":error})),
-                        };
-                        if request.url() == "/api/run" {
-                            value["trace"] = json!(trace);
-                            value["elapsedMs"] = json!(started.elapsed().as_millis());
-                        }
-                        eprintln!(
-                            "[any-a2a] {} {} status={} elapsedMs={}",
-                            request.method(),
-                            request.url().split('?').next().unwrap_or("/"),
-                            status,
-                            started.elapsed().as_millis()
-                        );
-                        (status, value)
-                    }
-                }
+    let runs = std::sync::Arc::new(Runs::default());
+    let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for request in server.incoming_requests() {
+        // Keep cancellation reachable during blocking SendMessage/polling.
+        // Only runs are concurrent; configuration mutations remain serialized.
+        if request.url() == "/api/run" {
+            if workers.load(std::sync::atomic::Ordering::SeqCst) >= 8 {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("{\"error\":\"Too many active runs\"}")
+                        .with_status_code(503),
+                );
+                continue;
             }
-        };
-        let response = tiny_http::Response::from_string(value.to_string())
-            .with_status_code(status)
-            .with_header(
-                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
-            );
-        let _ = request.respond(response);
+            workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (token, runs, workers) = (token.clone(), runs.clone(), workers.clone());
+            std::thread::spawn(move || {
+                handle_request(request, &token, &runs);
+                workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        } else {
+            handle_request(request, &token, &runs);
+        }
     }
     Ok(())
+}
+
+fn handle_request(mut request: tiny_http::Request, token: &str, runs: &Runs) {
+    let authorized = request
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("Authorization") && h.value.as_str() == format!("Bearer {token}"));
+    let (status, value) = if !authorized {
+        (401, json!({"error":"unauthorized"}))
+    } else {
+        let mut bytes = Vec::new();
+        let read = request
+            .as_reader()
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes);
+        if read.is_err() || bytes.len() > 4 * 1024 * 1024 {
+            (413, json!({"error":"request too large or unreadable"}))
+        } else {
+            let body = if bytes.is_empty() {
+                Ok(json!({}))
+            } else {
+                serde_json::from_slice(&bytes)
+            };
+            match body {
+                Err(_) => (400, json!({"error":"invalid JSON"})),
+                Ok(body) => {
+                    crate::take_request_trace();
+                    let started = std::time::Instant::now();
+                    let result = dispatch(request.method().as_str(), request.url(), body, runs);
+                    let trace = crate::take_request_trace();
+                    let (status, mut value) = match result {
+                        Ok(value) => (200, value),
+                        Err(error) => (400, json!({"error":error})),
+                    };
+                    if request.url() == "/api/run" {
+                        value["trace"] = json!(trace);
+                        value["elapsedMs"] = json!(started.elapsed().as_millis());
+                    }
+                    eprintln!(
+                        "[any-a2a] {} {} status={} elapsedMs={}",
+                        request.method(),
+                        request.url().split('?').next().unwrap_or("/"),
+                        status,
+                        started.elapsed().as_millis()
+                    );
+                    (status, value)
+                }
+            }
+        }
+    };
+    let response = tiny_http::Response::from_string(value.to_string())
+        .with_status_code(status)
+        .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap());
+    let _ = request.respond(response);
 }

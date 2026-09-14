@@ -113,9 +113,15 @@ fn transport_failure_has_safe_category() {
     let mut client =
         A2aClient::connect_card(&card("1.0", &url), None, Duration::from_secs(2)).unwrap();
     let error = client.run("private-prompt").unwrap_err();
-    assert!(error.contains("connection failed"), "{error}");
+    // A closed loopback port may time out before the OS reports connection
+    // refusal (notably on Windows). Both are valid safe transport categories.
+    assert!(
+        error.contains("connection failed") || error.contains("request timed out"),
+        "{error}"
+    );
     assert!(!error.contains("never-expose") && !error.contains("private-prompt"));
     assert!(error.contains("remote task may still be running"));
+    assert!(error.contains("未自动重试"));
 }
 
 #[test]
@@ -162,6 +168,104 @@ fn rpc_error_identifies_polling_method() {
         "{error}"
     );
     assert!(!error.contains("private remote details"));
+}
+
+#[test]
+fn cancellation_requires_remote_confirmation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    for version in ["0.3.0", "1.0"] {
+        for confirm in [true, false] {
+            let v1 = version == "1.0";
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/rpc", listener.local_addr().unwrap());
+            let flag = Arc::new(AtomicBool::new(false));
+            let worker_flag = flag.clone();
+            let worker = thread::spawn(move || {
+                for index in 0..2 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut headers = Vec::new();
+                    let mut byte = [0];
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        socket.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|s| s.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        request["method"],
+                        if index == 0 {
+                            if v1 { "SendMessage" } else { "message/send" }
+                        } else if v1 {
+                            "CancelTask"
+                        } else {
+                            "tasks/cancel"
+                        }
+                    );
+                    if index == 1 {
+                        assert_eq!(request["params"]["id"], "t1");
+                        if v1 {
+                            assert_eq!(request["params"]["tenant"], "acme");
+                        }
+                    }
+                    let state = if index == 1 && confirm {
+                        if v1 {
+                            "TASK_STATE_CANCELED"
+                        } else {
+                            "canceled"
+                        }
+                    } else if v1 {
+                        "TASK_STATE_WORKING"
+                    } else {
+                        "working"
+                    };
+                    let task = task(state);
+                    let result = if index == 0 && v1 {
+                        json!({"task":task})
+                    } else {
+                        task
+                    };
+                    if index == 0 {
+                        worker_flag.store(true, Ordering::SeqCst);
+                    }
+                    let response =
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .unwrap();
+                }
+            });
+            let mut client =
+                A2aClient::connect_card(&card(version, &endpoint), None, Duration::from_secs(5))
+                    .unwrap();
+            let result = client.run_cancellable("test", json!({}), &flag);
+            worker.join().unwrap();
+            if confirm {
+                assert_eq!(result.unwrap().state, "canceled");
+            } else {
+                assert!(result.unwrap_err().contains("取消未确认"));
+            }
+        }
+    }
 }
 
 #[test]

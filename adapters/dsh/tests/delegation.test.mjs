@@ -20,7 +20,7 @@ test('omitted flag starts native background job; false waits', async t => {
   assert.equal(started.kind,'background'); assert.equal(started.jobId,'job-1')
   assert.equal(host.sessions.get(started.sessionId).header.parentSession,'parent')
   assert.equal(job.kind,'subagent');assert.equal(job.owner,exec.agent)
-  const running=job.run();await running.done;assert.equal(disposed,1)
+  const running=job.run();assert.deepEqual(await running.done,{status:'completed',detail:'completed',output:''});assert.equal(disposed,1)
   assert.equal((await tool.execute({...args,run_in_background:false},exec)).kind,'foreground')
   assert.equal(disposed,2)
 })

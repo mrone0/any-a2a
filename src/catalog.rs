@@ -231,6 +231,15 @@ fn json_record(item: &StoredAgent, card_url: Option<String>) -> Value {
 }
 
 pub fn list_agents() -> Result<Vec<StoredAgent>> {
+    read_agents(None)
+}
+
+/// Resolve only the selected agent so unrelated unavailable URLs cannot block a run.
+pub fn get_agent(id: &str) -> Result<StoredAgent> {
+    read_agents(Some(id))?.into_iter().next().ok_or("Agent not found in local catalog".into())
+}
+
+fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
     let path = data_dir()?.join("agent-cards.jsonl");
     let bytes = match fs::read(path) {
         Ok(v) => v,
@@ -254,6 +263,7 @@ pub fn list_agents() -> Result<Vec<StoredAgent>> {
     }
     let mut result = Vec::new();
     for (id, v) in records {
+        if selected.is_some_and(|selected| selected != id) { continue; }
         let source = v["source"].as_str().ok_or("Card record missing source")?;
         let auth: crate::auth::Auth = serde_json::from_value(
             v.get("auth")

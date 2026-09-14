@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { runService } from '../../common/src/service-client.js'
+import { reportProgress } from './progress.js'
 import { mountCapabilities } from './capabilities.js'
 
 export const name = 'subagent-any-a2a'
@@ -11,11 +12,12 @@ export const inject = ['subagents']
 /** Validate deployment configuration before registering the provider. */
 function resolveConfig(config) {
   if (!config || typeof config !== 'object') throw new Error('any-a2a: configuration is required')
-  const allowed = new Set(['cardUrl', 'cardFile', 'serviceUrl', 'serviceToken', 'agentId', 'toolName', 'providerName', 'executable', 'maxOutputBytes'])
+  const allowed = new Set(['cardUrl', 'cardFile', 'serviceUrl', 'serviceToken', 'agentId', 'toolName', 'providerName', 'executable', 'dataDir', 'maxOutputBytes'])
   for (const key of Object.keys(config)) {
     if (!allowed.has(key)) throw new Error('any-a2a: unknown configuration field')
   }
   const resolved = {
+    dataDir: config.dataDir,
     cardUrl: config.cardUrl,
     serviceUrl: config.serviceUrl,
     serviceToken: config.serviceToken,
@@ -30,17 +32,21 @@ function resolveConfig(config) {
     if (resolved.cardUrl !== undefined || resolved.cardFile !== undefined) throw new Error('any-a2a: serviceUrl is mutually exclusive with cardUrl/cardFile')
     if (typeof resolved.serviceUrl !== 'string' || !resolved.serviceUrl.trim()) throw new Error('any-a2a: serviceUrl must be non-empty')
     if (typeof resolved.agentId !== 'string' || !resolved.agentId.trim()) throw new Error('any-a2a: agentId must be non-empty')
+  } else if (resolved.agentId !== undefined) {
+    if (typeof resolved.agentId !== 'string' || !resolved.agentId.trim() || resolved.agentId.includes('\0')) throw new Error('any-a2a: invalid agentId')
+    if (resolved.cardUrl !== undefined || resolved.cardFile !== undefined) throw new Error('any-a2a: agentId is mutually exclusive with cardUrl/cardFile')
   } else if ((resolved.cardUrl !== undefined) === (resolved.cardFile !== undefined)) {
     throw new Error('any-a2a: specify exactly one of cardUrl or cardFile')
   }
-  for (const key of [resolved.serviceUrl !== undefined ? 'serviceUrl' : (resolved.cardFile !== undefined ? 'cardFile' : 'cardUrl'), 'providerName', 'executable']) {
+  if (resolved.dataDir !== undefined && (typeof resolved.dataDir !== 'string' || !isAbsolute(resolved.dataDir) || resolved.dataDir.includes('\0'))) throw new Error('any-a2a: dataDir must be an absolute path')
+  for (const key of [resolved.serviceUrl !== undefined ? 'serviceUrl' : resolved.agentId !== undefined ? 'agentId' : (resolved.cardFile !== undefined ? 'cardFile' : 'cardUrl'), 'providerName', 'executable']) {
     if (typeof resolved[key] !== 'string' || !resolved[key].trim() || resolved[key].includes('\0')) {
       throw new Error(`any-a2a: ${key} must be a non-empty string without NUL`)
     }
   }
   if (resolved.cardFile !== undefined) {
     if (!isAbsolute(resolved.cardFile)) throw new Error('any-a2a: cardFile must be an absolute path')
-  } else if (resolved.serviceUrl === undefined) {
+  } else if (resolved.serviceUrl === undefined && resolved.agentId === undefined) {
     let url
     try { url = new URL(resolved.cardUrl) } catch { throw new Error('any-a2a: cardUrl must be an HTTP(S) URL') }
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
@@ -72,7 +78,7 @@ function decode(stdout) {
     || typeof value.state !== 'string') {
     return failure('any-a2a: invalid CLI response fields')
   }
-  const output = value.text ? [{ type: 'text', text: value.text }] : []
+  const output = value.raw !== undefined ? [{ type: 'text', text: JSON.stringify(value.raw) }] : value.text ? [{ type: 'text', text: value.text }] : []
   switch (value.state) {
     case 'completed': return { output, stopReason: 'completed' }
     case 'canceled': return { output, stopReason: 'aborted' }
@@ -126,9 +132,10 @@ export function createProvider(config) {
           async dispose() { abort(); await result },
         }
       }
-      const cardArgs = resolved.cardFile !== undefined ? ['--card-file', resolved.cardFile] : ['--card', resolved.cardUrl]
-      const child = spawn(resolved.executable, ['run', ...cardArgs, '--message', message], {
-        shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: childEnvironment(),
+      const cardArgs = resolved.agentId !== undefined ? ['--agent-id', resolved.agentId] : resolved.cardFile !== undefined ? ['--card-file', resolved.cardFile] : ['--card', resolved.cardUrl]
+      const streaming = resolved.agentId !== undefined
+      const child = spawn(resolved.executable, ['run', ...cardArgs, ...(streaming ? ['--events'] : []), '--message', message], {
+        shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...childEnvironment(), ...(resolved.dataDir ? { ANY_A2A_DATA_DIR: resolved.dataDir } : {}) },
       })
       let aborted = false
       let overflow = false
@@ -136,11 +143,29 @@ export function createProvider(config) {
       let closed = false
       let bytes = 0
       const chunks = []
+      let pending = ''
+      let finalValue
+      let invalidStream = false
+      const decoder = new TextDecoder()
+      const consume = text => {
+        pending += text
+        let newline
+        while ((newline = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, newline); pending = pending.slice(newline + 1)
+          try {
+            const event = JSON.parse(line)
+            if (event.event === 'progress') reportProgress(request.signal, event.data)
+            else if (event.event === 'result' && finalValue === undefined) finalValue = event.data
+            else invalidStream = true
+          } catch { invalidStream = true }
+        }
+      }
       const kill = () => { if (!closed) child.kill('SIGKILL') }
       const abort = () => { aborted = true; kill() }
       child.stdout.on('data', chunk => {
         bytes += chunk.length
         if (bytes > resolved.maxOutputBytes) { overflow = true; kill() }
+        else if (streaming) consume(decoder.decode(chunk, {stream:true}))
         else chunks.push(chunk)
       })
       // Drain, but never retain or disclose stderr: it may contain wire payloads or secrets.
@@ -149,10 +174,12 @@ export function createProvider(config) {
       const result = new Promise(resolve => {
         child.once('close', (code, signal) => {
           closed = true
+          if (streaming) { consume(decoder.decode()); if (pending.trim()) invalidStream = true }
           request.signal.removeEventListener('abort', abort)
           if (aborted) resolve({ output: [], stopReason: 'aborted' })
           else if (overflow) resolve(failure('any-a2a: CLI stdout exceeded maxOutputBytes'))
           else if (processError || code !== 0 || signal !== null) resolve(failure('any-a2a: CLI process failed'))
+          else if (streaming) resolve(invalidStream || finalValue === undefined ? failure('any-a2a: invalid CLI event stream') : decode(JSON.stringify(finalValue)))
           else resolve(decode(Buffer.concat(chunks).toString('utf8')))
         })
       })
@@ -187,5 +214,5 @@ export function createProvider(config) {
  */
 export function apply(ctx, config) {
   ctx.subagents.registerProvider(createProvider(config))
-  if (config.serviceUrl) mountCapabilities(ctx, config)
+  if (config.serviceUrl || config.agentId) mountCapabilities(ctx, config)
 }

@@ -16,7 +16,18 @@ thread_local! { static REQUEST_TRACE: std::cell::RefCell<Vec<Value>> = const { s
 pub fn take_request_trace() -> Vec<Value> {
     REQUEST_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
+thread_local! { static STREAM_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// Opt-in CLI event stream; never enabled by the desktop service.
+pub fn enable_trace_stream() { STREAM_TRACE.with(|enabled| enabled.set(true)); }
 fn trace(value: Value) {
+    STREAM_TRACE.with(|enabled| {
+        if enabled.get() {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{}", json!({"event":"progress","data":value}));
+            let _ = stdout.flush();
+        }
+    });
     REQUEST_TRACE.with(|t| {
         let mut t = t.borrow_mut();
         if t.len() < 200 {
@@ -383,7 +394,21 @@ impl A2aClient {
         message: &str,
         configuration: Value,
     ) -> Result<Outcome> {
+        self.run_cancellable(message, configuration, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Cancellation is cooperative: an in-flight HTTP request must return first.
+    /// Only a remote canceled state counts as confirmed cancellation.
+    pub fn run_cancellable(
+        &mut self,
+        message: &str,
+        configuration: Value,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Outcome> {
         let configuration = validate_configuration(&self.version, configuration)?;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("发送前已停止；未提交远程任务".into());
+        }
         let message_id = format!(
             "any-a2a-{}-{}",
             std::process::id(),
@@ -419,6 +444,7 @@ impl A2aClient {
         } else {
             value["kind"].as_str().unwrap_or("").to_owned()
         };
+        let mut last_status_message = String::new();
         loop {
             match Some(kind.as_str()) {
                 Some("message") => {
@@ -450,8 +476,15 @@ impl A2aClient {
             } else {
                 wire_state
             };
+            trace(json!({"stage":"task","taskId":task_id,"state":state}));
+            let status_message = parts_text(&value["status"]["message"], v1);
+            if !status_message.is_empty() && status_message != last_status_message {
+                // Remote content is untrusted output, never a local instruction.
+                trace(json!({"stage":"remote_status","taskId":task_id,"text":status_message}));
+                last_status_message = status_message;
+            }
             match state {
-                "completed" => {
+                "completed" | "canceled" => {
                     return Ok(Outcome {
                         raw: value.clone(),
                         text: task_text(&value, v1),
@@ -460,13 +493,36 @@ impl A2aClient {
                         state: state.into(),
                     });
                 }
-                "failed" | "canceled" | "rejected" | "input-required" | "auth-required" => {
+                "failed" | "rejected" | "input-required" | "auth-required" => {
                     return Err(format!(
                         "Remote task {task_id} ended/paused in state {state}; continuation is not supported by this prototype"
                     ));
                 }
                 "submitted" | "working" => {}
                 _ => return Err(format!("Unsupported task state {state}")),
+            }
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                // Give cancellation its own bounded deadline, even if polling
+                // has consumed the original task budget. Never retry it.
+                self.deadline = Instant::now() + Duration::from_secs(30);
+                let canceled = self.rpc(
+                    if v1 { "CancelTask" } else { "tasks/cancel" },
+                    json!({"id":task_id}),
+                ).map_err(|error| format!("取消未确认，远端任务可能仍在运行：{error}"))?;
+                if canceled["id"].as_str() != Some(&task_id) {
+                    return Err("取消未确认：远端返回的任务 ID 不匹配；远端任务可能仍在运行".into());
+                }
+                let canceled_state = canceled["status"]["state"].as_str().unwrap_or("");
+                if canceled_state != if v1 { "TASK_STATE_CANCELED" } else { "canceled" } {
+                    return Err("取消未确认：远端未返回 canceled 状态；任务可能已完成或仍在运行，请查询远端状态".into());
+                }
+                return Ok(Outcome {
+                    text: task_text(&canceled, v1),
+                    task_id: Some(task_id),
+                    context_id: string(&canceled, "contextId"),
+                    state: "canceled".into(),
+                    raw: canceled,
+                });
             }
             let remaining = self
                 .deadline

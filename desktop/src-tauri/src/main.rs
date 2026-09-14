@@ -2,6 +2,7 @@
 use std::{io::{BufRead, BufReader}, process::{Child, Command, Stdio}, sync::Mutex};
 use tauri::Manager;
 mod clients;
+mod setup_command;
 #[path = "../../../adapters/dsh/desktop/apply.rs"]
 mod apply_dsh;
 use apply_dsh::apply_dsh;
@@ -40,9 +41,17 @@ fn service_status(state: tauri::State<'_, Service>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn run_card(address: tauri::State<'_, Connection>, id: String, message: String, configuration: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+async fn run_card(address: tauri::State<'_, Connection>, id: String, message: String, configuration: Option<serde_json::Value>, run_id: String) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::new();
-    client.post(format!("http://{}/api/run", address.address)).bearer_auth(&address.token).json(&serde_json::json!({"id":id,"message":message,"configuration":configuration.unwrap_or_else(|| serde_json::json!({}))})).send().await.map_err(|_| "Service unavailable".to_string())?.json().await.map_err(|_| "Invalid service response".to_string())
+    client.post(format!("http://{}/api/run", address.address)).bearer_auth(&address.token).json(&serde_json::json!({"id":id,"runId":run_id,"message":message,"configuration":configuration.unwrap_or_else(|| serde_json::json!({}))})).send().await.map_err(|_| "Service unavailable".to_string())?.json().await.map_err(|_| "Invalid service response".to_string())
+}
+
+#[tauri::command]
+async fn cancel_run(address: tauri::State<'_, Connection>, run_id: String) -> Result<serde_json::Value, String> {
+    reqwest::Client::new().post(format!("http://{}/api/cancel", address.address))
+        .bearer_auth(&address.token).json(&serde_json::json!({"runId":run_id}))
+        .send().await.map_err(|_| "取消请求失败；远端状态未知".to_string())?
+        .json().await.map_err(|_| "取消响应无效；远端状态未知".to_string())
 }
 
 #[tauri::command]
@@ -61,10 +70,34 @@ async fn cards_api(address: tauri::State<'_, Connection>, body: Option<serde_jso
         .json().await.map_err(|_| "Invalid service response".to_string())
 }
 
+#[tauri::command]
+fn pi_setup() -> Result<serde_json::Value, String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let extension = root.join("adapters/pi/index.ts").canonicalize().map_err(|_| "Pi 扩展文件不存在；当前需要保留源码目录")?;
+    let executable = std::env::var_os("ANY_A2A_EXECUTABLE").map(std::path::PathBuf::from).unwrap_or_else(|| root.join("target/debug").join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX)));
+    if !executable.is_file() { return Err("CLI 不存在，请先在项目根目录 cargo build".into()); }
+    let executable = executable.canonicalize().map_err(|_| "Cannot resolve CLI")?;
+    let data_dir = any_a2a::catalog::data_dir()?;
+    let (shell, command) = setup_command::pi_command(&executable.to_string_lossy(), &data_dir.to_string_lossy(), &extension.to_string_lossy(), cfg!(target_os = "windows"));
+    Ok(serde_json::json!({"command":command,"shell":shell,"platform":std::env::consts::OS,"installed":false}))
+}
+
+#[tauri::command]
+fn window_control(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
+    let result = match action.as_str() {
+        "minimize" => window.minimize(),
+        "maximize" => if window.is_maximized().map_err(|e| e.to_string())? { window.unmaximize() } else { window.maximize() },
+        "close" => window.close(),
+        "drag" => window.start_dragging(),
+        _ => return Err("Unknown window action".into()),
+    };
+    result.map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Service(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![service_status, cards_api, run_card, scan_clients, delete_card, config_location, read_config, save_config, open_config, discover_dsh, apply_dsh])
+        .invoke_handler(tauri::generate_handler![pi_setup, window_control, service_status, cards_api, run_card, cancel_run, scan_clients, delete_card, config_location, read_config, save_config, open_config, discover_dsh, apply_dsh])
         .setup(|app| {
             let token = uuid::Uuid::new_v4().to_string();
             let mut child = start_service(&token).map_err(std::io::Error::other)?;
