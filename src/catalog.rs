@@ -236,7 +236,10 @@ pub fn list_agents() -> Result<Vec<StoredAgent>> {
 
 /// Resolve only the selected agent so unrelated unavailable URLs cannot block a run.
 pub fn get_agent(id: &str) -> Result<StoredAgent> {
-    read_agents(Some(id))?.into_iter().next().ok_or("Agent not found in local catalog".into())
+    read_agents(Some(id))?
+        .into_iter()
+        .next()
+        .ok_or("Agent not found in local catalog".into())
 }
 
 fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
@@ -263,7 +266,9 @@ fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
     }
     let mut result = Vec::new();
     for (id, v) in records {
-        if selected.is_some_and(|selected| selected != id) { continue; }
+        if selected.is_some_and(|selected| selected != id) {
+            continue;
+        }
         let source = v["source"].as_str().ok_or("Card record missing source")?;
         let auth: crate::auth::Auth = serde_json::from_value(
             v.get("auth")

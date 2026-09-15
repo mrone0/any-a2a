@@ -10,6 +10,10 @@ $('window-bar').onmousedown = event => {
 $('window-bar').ondblclick = event => { if (!event.target.closest('button')) controlWindow('maximize'); };
 async function api(body=null){return invoke('cards_api',{body})}
 function view(name){document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===name));document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.view===name))}
+$('pi-install').onclick=async()=>{const b=$('pi-install');b.disabled=true;try{const r=await invoke('pi_install');$('pi-setup-hint').textContent='已持久安装到 Pi，请重启 Pi 或执行 /reload。';$('pi-command').textContent=r.output||'安装完成';}catch(e){$('pi-setup-hint').textContent=`安装失败：${e.message||e}`;}finally{b.disabled=false}}
+async function preparePi(){ $('pi-config').hidden=false; try { const setup=await invoke('pi_setup'); $('pi-command').textContent=setup.command; $('pi-setup-hint').textContent=`当前系统：${setup.platform}。在 ${setup.shell} 终端中执行以下命令。`; } catch(e){ $('pi-command').textContent=`配置准备失败：${e.message||e}`; } }
+async function discoverDsh(){ $('dsh-config').hidden=false; try { const paths=await invoke('discover_dsh'); $('dsh-candidates').replaceChildren(...paths.map(path=>{const o=document.createElement('option');o.value=path;o.textContent=path;return o})); $('dsh-patch').value=paths[0]||''; } catch(e){ $('dsh-discovery-status').textContent=`检测失败：${e.message||e}`; } }
+function openClientPanel(id){ view('clients'); document.querySelectorAll('.client-config').forEach(x=>x.hidden=true); const panel=document.getElementById(`${id}-config`); if(panel) panel.hidden=false; panel?.scrollIntoView({block:'start'}); if(id==='pi') preparePi(); else if(id==='dsh') discoverDsh(); }
 async function load(){try{agents=await api();if(!Array.isArray(agents))throw Error('服务返回异常');render();$('dot').classList.add('ok');$('service-text').textContent='运行中';$('setting-service').textContent='运行中'}catch(e){$('dot').classList.remove('ok');$('service-text').textContent='服务不可用';$('setting-service').textContent='不可用';showStatus(`服务错误：${e.message}`)}}
 function render() {
   $('stats').textContent = `${agents.length} 个 Agent · 选择一个开始测试`;
@@ -142,7 +146,7 @@ function renderClientEntrances() {
     action.textContent = id === 'dsh' ? '配置 DSH' : id === 'pi' ? '连接 Pi' : '暂未开放'; action.disabled = !['dsh','pi'].includes(id);
     action.onclick = async () => {
       if (id === 'pi') {
-        $('pi-config').hidden = false; action.disabled = true;
+        openClientPanel('pi'); action.disabled = true;
         $('pi-command').textContent = '正在解析本机路径…';
         try {
           const setup = await invoke('pi_setup'); $('pi-command').textContent = setup.command;
@@ -153,7 +157,7 @@ function renderClientEntrances() {
         finally { action.disabled = false; }
         return;
       }
-      $('dsh-config').hidden = false;
+      openClientPanel('dsh');
       $('install-agent-count').textContent = `将应用全部 ${agents.length} 个已保存 Agent，无需逐个选择。`;
       action.disabled = true; $('dsh-discovery-status').textContent = '正在检测 DSH profile…';
       try {

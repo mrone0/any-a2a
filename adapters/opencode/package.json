@@ -1,0 +1,9 @@
+{
+  "name": "@any-a2a/opencode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {"@opencode-ai/plugin": "1.17.13"},
+  "scripts": {"test": "node --test tests/*.test.mjs"}
+}

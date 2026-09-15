@@ -7,3 +7,6 @@ node_modules/
 /desktop/src-tauri/target/
 
 adapters/dsh/.npm-cache/
+
+/desktop/src-tauri/binaries/
+/desktop/src-tauri/tauri.ci.json

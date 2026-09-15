@@ -31,7 +31,11 @@ fn run() -> Result<(), String> {
     let mut agent_id = None;
     let (mut card, mut card_file, mut message, mut timeout) = (None, None, None, 120u64);
     while let Some(flag) = args.next() {
-        if flag == "--events" { events = true; any_a2a::enable_trace_stream(); continue; }
+        if flag == "--events" {
+            events = true;
+            any_a2a::enable_trace_stream();
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("Missing value for {flag}"))?;

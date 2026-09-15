@@ -1,0 +1,91 @@
+name: Build desktop and CLI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+          - name: macos-intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: ''
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            suffix: ''
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+          key: ${{ matrix.target }}
+      - name: Install desktop dependencies
+        run: npm ci --prefix desktop
+      - name: Check CLI and run native tests
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+      - name: Build CLI
+        run: cargo build --locked --release --target '${{ matrix.target }}' --bin any-a2a
+      - name: Stage native sidecar
+        env:
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          mkdir -p desktop/src-tauri/binaries
+          cp "target/$TARGET/release/any-a2a$SUFFIX" "desktop/src-tauri/binaries/any-a2a-$TARGET$SUFFIX"
+          node -e 'require("fs").writeFileSync("desktop/src-tauri/tauri.ci.json", JSON.stringify({bundle:{externalBin:["binaries/any-a2a"]}}))'
+      - name: Build desktop installers (unsigned)
+        run: npm --prefix desktop run tauri -- build --target '${{ matrix.target }}' --config src-tauri/tauri.ci.json
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: any-a2a-cli-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/any-a2a${{ matrix.suffix }}
+          if-no-files-found: error
+      - name: Upload desktop bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: any-a2a-desktop-${{ matrix.name }}
+          path: |
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

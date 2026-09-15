@@ -52,10 +52,11 @@ test('actual Pi loader, native CLI, live progress, and persisted tool details ro
     const {getAgentDir}=await import(pathToFileURL(join(root,'dist/config.js')).href)
     const {RunStore}=await import('../runs.mjs')
     runDirectory=new RunStore(join(getAgentDir(),'a2a-runs'),ctx.sessionManager.getSessionId()).dir
-    const result=await tool.execute('call-1',{agentId:'fixture',task:'test 中文'},new AbortController().signal,u=>updates.push(u),ctx)
+    const result=await tool.execute('call-1',{agentId:'fixture',task:'test 中文',background:false},new AbortController().signal,u=>updates.push(u),ctx)
     assert.match(result.content[0].text,/PI-A2A-OK/)
-    assert.match(result.content[0].text,/模拟进度/)
-    assert.match(result.content[0].text,/不代表已验证客户端实时渲染/)
+    assert.doesNotMatch(result.content[0].text,/模拟进度/)
+    assert.match(JSON.stringify(result.details.progress),/模拟进度/)
+    assert.match(result.content[0].text,/不加入主会话正文/)
     assert.equal(result.details.state,'completed')
     assert.ok(updates.some(u=>JSON.stringify(u).includes('模拟进度')))
     assert.ok(!JSON.stringify(result).includes('fixture-secret'))
@@ -68,12 +69,12 @@ test('actual Pi loader, native CLI, live progress, and persisted tool details ro
     await writeFile(sessionFile,[sm.getHeader(),...entries].map(row=>JSON.stringify(row)).join('\n')+'\n')
     const restored=SessionManager.open(sessionFile).getEntries().at(-1).message
     assert.equal(restored.details.state,'completed')
-    assert.match(restored.content[0].text,/模拟进度/)
+    assert.doesNotMatch(restored.content[0].text,/模拟进度/)
     assert.deepEqual(restored.details.progress,result.details.progress)
     const abort=new AbortController()
-    const pending=tool.execute('call-2',{agentId:'fixture',task:'abort'},abort.signal,()=>abort.abort(),ctx)
+    const pending=tool.execute('call-2',{agentId:'fixture',task:'abort',background:false},abort.signal,()=>abort.abort(),ctx)
     await assert.rejects(pending,/Local delegation stopped/)
-    const background=await tool.execute('call-3',{agentId:'fixture',task:'background',background:true},new AbortController().signal,undefined,ctx)
+    const background=await tool.execute('call-3',{agentId:'fixture',task:'background'},new AbortController().signal,undefined,ctx)
     assert.equal(background.details.state,'running')
     const inspect=extension.tools.get('a2a_runs').definition
     let snapshot

@@ -107,10 +107,10 @@ fn locate_executable() -> Result<PathBuf> {
             "any-a2a"
         };
         let mut paths = vec![];
-        if let Ok(current) = std::env::current_exe() {
-            if let Some(parent) = current.parent() {
-                paths.push(parent.join(name));
-            }
+        if let Ok(current) = std::env::current_exe()
+            && let Some(parent) = current.parent()
+        {
+            paths.push(parent.join(name));
         }
         paths.push(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -120,20 +120,20 @@ fn locate_executable() -> Result<PathBuf> {
         paths
     };
     for candidate in candidates {
-        if let Ok(path) = candidate.canonicalize() {
-            if let Ok(meta) = fs::metadata(&path) {
-                if !meta.is_file() {
+        if let Ok(path) = candidate.canonicalize()
+            && let Ok(meta) = fs::metadata(&path)
+        {
+            if !meta.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
                     continue;
                 }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o111 == 0 {
-                        continue;
-                    }
-                }
-                return Ok(path);
             }
+            return Ok(path);
         }
     }
     Err("Rust CLI executable missing or not executable. Build cargo build --release, or set ANY_A2A_EXECUTABLE to its trusted path. No command was executed.".into())
