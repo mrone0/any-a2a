@@ -2,12 +2,6 @@ const $=id=>document.getElementById(id)
 let source='url',agents=[]
 function showStatus(message, ok=false){const node=$('status');node.textContent=message;node.className=`status show ${ok?'ok':''}`}
 const invoke=(cmd,args)=>window.__TAURI__.core.invoke(cmd,args)
-const controlWindow = action => invoke('window_control', {action}).catch(error => console.error('Window action failed', error));
-document.querySelectorAll('[data-window]').forEach(button => button.onclick = () => controlWindow(button.dataset.window));
-$('window-bar').onmousedown = event => {
-  if (event.button === 0 && !event.target.closest('button') && event.detail !== 2) controlWindow('drag');
-};
-$('window-bar').ondblclick = event => { if (!event.target.closest('button')) controlWindow('maximize'); };
 async function api(body=null){return invoke('cards_api',{body})}
 function view(name){document.querySelectorAll('.view').forEach(x=>x.classList.toggle('active',x.id===name));document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.view===name))}
 $('pi-install').onclick=async()=>{const b=$('pi-install');b.disabled=true;try{const r=await invoke('pi_install');$('pi-setup-hint').textContent='已持久安装到 Pi，请重启 Pi 或执行 /reload。';$('pi-command').textContent=r.output||'安装完成';}catch(e){$('pi-setup-hint').textContent=`安装失败：${e.message||e}`;}finally{b.disabled=false}}

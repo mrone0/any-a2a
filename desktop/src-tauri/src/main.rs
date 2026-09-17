@@ -209,31 +209,12 @@ fn pi_install() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({"installed":true,"output":text,"error":error}))
 }
 
-#[tauri::command]
-fn window_control(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
-    let result = match action.as_str() {
-        "minimize" => window.minimize(),
-        "maximize" => {
-            if window.is_maximized().map_err(|e| e.to_string())? {
-                window.unmaximize()
-            } else {
-                window.maximize()
-            }
-        }
-        "close" => window.close(),
-        "drag" => window.start_dragging(),
-        _ => return Err("Unknown window action".into()),
-    };
-    result.map_err(|e| e.to_string())
-}
-
 fn main() {
     tauri::Builder::default()
         .manage(Service(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             pi_setup,
             pi_install,
-            window_control,
             service_status,
             cards_api,
             run_card,
