@@ -21,7 +21,7 @@ any-a2a 将「客户端生命周期」和「A2A 网络通信」分开：
     │  原生委派入口（Pi tool / DSH provider）
     ▼
 any-a2a CLI（本地独立进程）
-    │  Agent Card + message/send + tasks/get
+    │  Agent Card + SendMessage/GetTask（A2A 1.0 JSON-RPC）
     ▼
 远端 A2A Agent
     │  直接 Message 或 Task 轮询结果
@@ -31,20 +31,21 @@ any-a2a CLI（本地独立进程）
 
 1. 客户端通过受支持的适配层发现本地保存的 Agent，或提供 Agent Card URL。
 2. CLI 读取 Agent Card，校验协议版本、同源 endpoint 和必要的认证信息。
-3. CLI 向远端 Agent 发送 `message/send` JSON-RPC 请求。远端可以直接返回文本，也可以返回 Task。
-4. 对于 Task，CLI 按策略调用 `tasks/get` 轮询，直到任务完成、失败、暂停或超时。
+3. CLI 向远端 Agent 发送 `SendMessage`（A2A 1.0）或 `message/send`（A2A 0.3.0）JSON-RPC 请求。远端可以直接返回 Message，也可以返回 Task。
+4. 对于 Task，CLI 按策略调用 `GetTask`（A2A 1.0）或 `tasks/get`（A2A 0.3.0）轮询，直到任务完成、失败、暂停或超时。
 5. CLI 输出一个结构化 JSON 结果；适配层把它映射为客户端自己的结果和生命周期状态，并持久化有界的运行记录。
 
 CLI 是独立的执行边界：桌面 App 退出不会中断客户端自己启动的 CLI 调用。客户端停止本地进程也**不代表**远端任务已经取消；只有远端返回匹配任务 ID 且状态为 `canceled`，才能确认远端取消。项目不会自动重试消息提交，以免重复触发有副作用的远程任务。
 
 ## 特性与安全边界
 
-- 支持 A2A `0.3.0` JSON-RPC：Agent Card、`message/send`、`tasks/get`。
+- 支持 A2A `1.0` JSON-RPC 绑定：PascalCase 方法 `SendMessage`/`GetTask`/`CancelTask`、`A2A-Version: 1.0` 请求头、`ROLE_USER`/`TASK_STATE_*` 枚举，以及 Card 的 `supportedInterfaces` 接口选择（含 `tenant` 透传）。
+- 兼容 A2A `0.3.0` JSON-RPC：`message/send`/`tasks/get`/`tasks/cancel` 和旧版 Card 字段（`url`/`preferredTransport`/`protocolVersion`）。
 - 支持直接 Message 结果和 Task 轮询，读取文本 artifact 与状态消息。
 - 支持 Bearer token；HTTP 重定向禁用，Card 与实际 endpoint 必须同源。
 - 对 HTTP 请求、响应体、CLI 输出、进度和持久化记录设置大小/时间上限。
 - 远端状态、进度和最终输出均视为不可信数据，不会根据远端输出自动执行本地工具。
-- 不支持 A2A 1.0、SSE、gRPC、OAuth、多模态文件传输、任务恢复和双向补充输入。
+- A2A 1.0 仅实现 JSON-RPC 绑定的核心操作；不支持 `SendStreamingMessage`/`SubscribeToTask`（SSE 流式）、`ListTasks`、push notification、gRPC 与 HTTP+REST 绑定、OAuth、多模态文件传输、任务恢复和双向补充输入。
 - `input-required` / `auth-required` 会明确报错，不会伪装成完成。
 - 同源校验不是完整 SSRF 沙箱；URL 来自可信的本地配置，本版不开放远程配置 API。
 - `--message` 会作为命令行参数传递，可能被本机进程查看工具看到；敏感认证信息应使用环境变量或本地保存的 Agent 配置，不要写进仓库、URL 或提示词。
@@ -123,7 +124,7 @@ DSH 的安装与验证说明见 [adapters/dsh](adapters/dsh/README.md)；Pi 的�
 ## 取消、持久化与限制
 
 - 本地 abort、超时或杀死 CLI 只停止本地等待，不自动取消远端工作。
-- A2A 0.3 的远端取消只能在已取得任务 ID 后通过 `tasks/cancel` 请求，并以远端确认结果为准。
+- A2A 远端取消只能在已取得任务 ID 后通过 `CancelTask`（A2A 1.0）或 `tasks/cancel`（A2A 0.3.0）请求，并以远端确认的 `canceled` 状态为准。
 - 本地 API 的 `POST /api/run` 支持唯一 `runId`，`POST /api/cancel` 只表示本地接受取消意图；最终状态以运行结果为准。
 - 运行记录与客户端 parent session 关联；恢复时不会重新提交任务。崩溃期间的中间进度不保证持久化。
 - 适配层会限制输出、并发、记录数量和进程生命周期；完整的有界结果保存在 tool details 或运行记录中，模型上下文只接收可读摘要。

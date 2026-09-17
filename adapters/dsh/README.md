@@ -83,7 +83,7 @@ CLI success must be one JSON object containing `text` (string), `task_id` and `c
 
 `run.id` is a fresh DSH remote-run identity, **not** an A2A task ID. A2A task/context IDs are validated but not exposed through DSH's one-shot result, which has no metadata slot. No local Agent, durable child session, catalog entry, resumable context, or send-message operation is created.
 
-Abort or `dispose()` forcibly kills the direct CLI process with SIGKILL and waits for its `close` event. Disposal is idempotent. **Local cancellation, timeout, or process kill does not send A2A remote cancellation; the remote task can continue.** There is no adapter-owned timeout or process-tree management. Use the native Rust executable directly, not a wrapper that spawns descendants. HTTP version support, same-origin card endpoint checks, polling and timeout policy belong to the CLI (currently A2A 0.3.0 JSONRPC). There is no token streaming or automatic retry.
+Abort or `dispose()` forcibly kills the direct CLI process with SIGKILL and waits for its `close` event. Disposal is idempotent. **Local cancellation, timeout, or process kill does not send A2A remote cancellation; the remote task can continue.** There is no adapter-owned timeout or process-tree management. Use the native Rust executable directly, not a wrapper that spawns descendants. Protocol version support, same-origin card endpoint checks, polling and timeout policy belong to the CLI (A2A 1.0 JSON-RPC, with A2A 0.3.0 JSON-RPC fallback). There is no token streaming or automatic retry.
 
 ## Tests
 
