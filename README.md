@@ -2,9 +2,27 @@
 
 **any-a2a** 是一个面向客户端的开源远程 Subagent 委派工具：它把本地客户端中的一次委派请求，通过 Rust CLI 转换为 A2A（Agent2Agent）协议请求，发送给远端 Agent，再将结果安全地带回原客户端。
 
-> 当前版本：`0.1.0-alpha.1`（预览版）
+> 当前版本：`0.1.0`
 >
 > 本项目仍处于可行性验证阶段。它不是完整的 A2A 平台，也不是 LLM provider；桌面端主要负责配置、目录管理和测试，真正的任务执行由调用它的客户端和 Rust CLI 负责。
+
+## 下载与安装
+
+从 [GitHub Releases](https://github.com/mrone0/any-a2a/releases/latest) 下载对应平台的文件：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows x64 | `any-a2a-desktop-windows-x64-*_x64-setup.exe`（推荐）或 `*_x64_en-US.msi` |
+| macOS Apple Silicon | `any-a2a-desktop-macos-arm64-*_aarch64.dmg` |
+| macOS Intel | `any-a2a-desktop-macos-intel-*_x64.dmg` |
+| CLI（Windows x64 / macOS 双架构） | `any-a2a-cli-*` |
+
+安装包未做代码签名，首次安装时系统可能额外确认一次：
+
+- **Windows**：若弹出 SmartScreen「已保护你的电脑」，点击「更多信息」→「仍要运行」即可继续安装。
+- **macOS**：若提示「无法验证开发者」，在 Finder 中右键点击 App 选择「打开」，或到「系统设置 → 隐私与安全性」中允许。
+
+杀毒软件可能对未签名程序误报；如有顾虑，可按「构建与检查」一节从源码自行构建。
 
 ## 开源声明
 
