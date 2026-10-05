@@ -1,9 +1,15 @@
 name: Build desktop and CLI
 
+# Code signing turns on automatically when these repository secrets exist:
+#   Windows: WINDOWS_CERTIFICATE (base64-encoded .pfx), WINDOWS_CERTIFICATE_PASSWORD
+#   macOS:   APPLE_CERTIFICATE (base64-encoded .p12), APPLE_CERTIFICATE_PASSWORD,
+#            APPLE_SIGNING_IDENTITY (defaults to "Developer ID Application"),
+#            APPLE_ID + APPLE_PASSWORD (app-specific password) + APPLE_TEAM_ID for notarization
+# Without them the bundles stay unsigned.
 on:
   push:
     branches: [main]
-    tags: ['v*-alpha*']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -56,6 +62,48 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install desktop dependencies
         run: npm ci --prefix desktop
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host "WINDOWS_CERTIFICATE secret not set; building unsigned Windows bundles."
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "any-a2a-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE.Trim()))
+          $securePassword = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          "WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Imported signing certificate '$($cert.Subject)' ($($cert.Thumbprint))"
+      - name: Configure macOS signing and notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE}" ]; then
+            echo "APPLE_CERTIFICATE secret not set; building unsigned macOS bundles."
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE=${APPLE_CERTIFICATE}"
+            echo "APPLE_CERTIFICATE_PASSWORD=${APPLE_CERTIFICATE_PASSWORD}"
+            echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY:-Developer ID Application}"
+            if [ -n "${APPLE_ID}" ] && [ -n "${APPLE_PASSWORD}" ]; then
+              echo "APPLE_ID=${APPLE_ID}"
+              echo "APPLE_PASSWORD=${APPLE_PASSWORD}"
+              echo "APPLE_TEAM_ID=${APPLE_TEAM_ID}"
+            fi
+          } >> "$GITHUB_ENV"
       - name: Check CLI and run native tests
         run: |
           cargo clippy --locked --all-targets -- -D warnings
@@ -70,8 +118,8 @@ jobs:
         run: |
           mkdir -p desktop/src-tauri/binaries
           cp "target/$TARGET/release/any-a2a$SUFFIX" "desktop/src-tauri/binaries/any-a2a-$TARGET$SUFFIX"
-          node -e 'require("fs").writeFileSync("desktop/src-tauri/tauri.ci.json", JSON.stringify({bundle:{externalBin:["binaries/any-a2a"]}}))'
-      - name: Build desktop installers (unsigned)
+          node -e 'const fs=require("fs");const c={bundle:{externalBin:["binaries/any-a2a"]}};if(process.env.WIN_CERT_THUMBPRINT){c.bundle.windows={certificateThumbprint:process.env.WIN_CERT_THUMBPRINT,digestAlgorithm:"sha256",timestampUrl:"http://timestamp.digicert.com"}}fs.writeFileSync("desktop/src-tauri/tauri.ci.json",JSON.stringify(c))'
+      - name: Build desktop installers (signed when signing secrets configured)
         run: npm --prefix desktop run tauri -- build --target '${{ matrix.target }}' --config src-tauri/tauri.ci.json
       - name: Upload CLI
         uses: actions/upload-artifact@v4
@@ -91,9 +139,9 @@ jobs:
           retention-days: 14
 
   release:
-    name: Create GitHub pre-release
+    name: Create GitHub release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-alpha')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
@@ -117,6 +165,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          prerelease: true
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-rc') }}
           generate_release_notes: true
           files: release-files/*
