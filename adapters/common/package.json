@@ -1,8 +1,9 @@
 {
   "name": "@any-a2a/common",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
-  "exports": { "./service-client": "./src/service-client.js" },
-  "files": ["src"]
+  "exports": { "./service-client": "./src/service-client.js", "./cli-transport": "./src/cli-transport.js" },
+  "files": ["src"],
+  "scripts": { "test": "node --test tests/*.test.mjs" }
 }

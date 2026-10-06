@@ -69,7 +69,15 @@ fn run() -> Result<(), String> {
                 &agent.auth,
             )?
         } else {
-            any_a2a::A2aClient::connect_card_authenticated(&agent.raw, None, duration, &agent.auth)?
+            any_a2a::A2aClient::connect_card_authenticated(
+                agent
+                    .raw
+                    .as_ref()
+                    .ok_or("Saved manual Agent is missing its Card")?,
+                None,
+                duration,
+                &agent.auth,
+            )?
         }
     } else {
         match (card, card_file) {
@@ -92,13 +100,12 @@ fn run() -> Result<(), String> {
         }
     };
     let result = client.run(&message)?;
-    if events {
-        println!("{}", serde_json::json!({"event":"result","data":result}));
-        return Ok(());
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&result).map_err(|_| "Result serialization failed")?
-    );
+    let frame = any_a2a::serialize_outcome(&result, events)?;
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(&frame)
+        .and_then(|_| stdout.write_all(b"\n"))
+        .map_err(|_| "Cannot write CLI result")?;
     Ok(())
 }

@@ -17,7 +17,7 @@ export class RunStore {
   async save(record) {
     if(record.owner!==this.owner)throw Error('Run owner mismatch')
     const text=JSON.stringify(record)
-    if(Buffer.byteLength(text)>10*1024*1024)throw Error('Run record exceeds 10 MiB')
+    if(Buffer.byteLength(text)>20*1024*1024)throw Error('Run record exceeds 20 MiB')
     await mkdir(this.dir,{recursive:true,mode:0o700})
     const file=this.path(record.id),temp=file+'.'+randomUUID()+'.tmp'
     try {
@@ -27,7 +27,7 @@ export class RunStore {
   }
   async get(id) {
     const file=this.path(id)
-    if((await stat(file)).size>10*1024*1024)throw Error('Run record too large')
+    if((await stat(file)).size>20*1024*1024)throw Error('Run record too large')
     const r=JSON.parse(await readFile(file,'utf8'))
     if(r.version!==1||r.id!==id||r.owner!==this.owner||!Array.isArray(r.progress))throw Error('Invalid run record')
     return r
@@ -39,5 +39,12 @@ export class RunStore {
     const records=[]
     for(const name of names.filter(n=>n.endsWith('.json')))records.push(await this.get(name.slice(0,-5)))
     return records.sort((a,b)=>b.startedAt-a.startedAt)
+  }
+  async count() {
+    let names
+    try{names=await readdir(this.dir)}catch(e){if(e.code==='ENOENT')return 0;throw e}
+    const count=names.filter(name=>name.endsWith('.json')).length
+    if(count>200)throw Error('Run retention limit exceeded; archive old run files')
+    return count
   }
 }

@@ -1,5 +1,5 @@
 //! Loopback service. HTTP framing is handled by tiny_http rather than a single TCP read.
-use crate::catalog::{append_authenticated, list_agents};
+use crate::catalog::{append_authenticated, get_agent, list_agents};
 use crate::{A2aClient, Result};
 use serde_json::{Value, json};
 use std::{io::Read, time::Duration};
@@ -7,6 +7,45 @@ use std::{io::Read, time::Duration};
 type Runs = std::sync::Mutex<
     std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
 >;
+
+/// Own registration across every fallible preflight step, not just RPC execution.
+struct RunRegistration<'a> {
+    runs: &'a Runs,
+    id: String,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl<'a> RunRegistration<'a> {
+    fn new(runs: &'a Runs, id: String) -> Result<Self> {
+        validate_run_id(&id)?;
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut active = runs.lock().map_err(|_| "Run lock poisoned")?;
+        if active.contains_key(&id) {
+            return Err("Duplicate runId".into());
+        }
+        active.insert(id.clone(), flag.clone());
+        Ok(Self { runs, id, flag })
+    }
+    fn check_before_submission(&self) -> Result<()> {
+        if self.flag.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("发送前已停止；未提交远程任务".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for RunRegistration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.runs.lock() {
+            active.remove(&self.id);
+        }
+    }
+}
+fn validate_run_id(id: &str) -> Result<()> {
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        return Err("Invalid runId".into());
+    }
+    Ok(())
+}
 
 fn dispatch(method: &str, path: &str, value: Value, runs: &Runs) -> Result<Value> {
     match (method, path) {
@@ -58,59 +97,54 @@ fn dispatch(method: &str, path: &str, value: Value, runs: &Runs) -> Result<Value
         }
         ("POST", "/api/cancel") => {
             let id = value["runId"].as_str().ok_or("missing runId")?;
+            validate_run_id(id)?;
             let runs = runs.lock().map_err(|_| "Run lock poisoned")?;
             let flag = runs.get(id).ok_or("运行不存在或已结束；未发送取消请求")?;
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(
-                json!({"requested":true,"message":"已请求取消；等待当前请求返回并取得任务 ID 后发送远端取消，尚未确认"}),
+                json!({"requested":true,"message":"已接受取消请求；尚未提交则停止发送，已提交则等待请求返回和任务 ID 后请求远端取消，尚未确认远端取消"}),
             )
         }
         ("POST", "/api/run") => {
             let id = value["id"].as_str().ok_or("missing id")?;
             let message = value["message"].as_str().ok_or("missing message")?;
-            let agent = list_agents()?
-                .into_iter()
-                .find(|a| a.id == id)
-                .ok_or("agent not found")?;
-            let mut client = if agent.source == "url" {
+            let run_id = match value.get("runId") {
+                Some(value) => value.as_str().ok_or("Invalid runId")?.to_owned(),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            let run = RunRegistration::new(runs, run_id)?;
+            run.check_before_submission()?;
+            let agent = get_agent(id)?;
+            run.check_before_submission()?;
+            let connected = if agent.source == "url" {
                 A2aClient::connect_authenticated(
                     agent.card_url.as_deref().ok_or("missing card URL")?,
                     None,
                     Duration::from_secs(120),
                     &agent.auth,
-                )?
+                )
             } else {
                 A2aClient::connect_card_authenticated(
-                    &agent.raw,
+                    agent.raw.as_ref().ok_or("Manual Agent has no Card")?,
                     None,
                     Duration::from_secs(120),
                     &agent.auth,
-                )?
+                )
             };
-            let run_id = value["runId"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let mut active = runs.lock().map_err(|_| "Run lock poisoned")?;
-                if active.contains_key(&run_id) {
-                    return Err("Duplicate runId".into());
-                }
-                active.insert(run_id.clone(), flag.clone());
-            }
-            let result = client.run_cancellable(
-                message,
-                value
-                    .get("configuration")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-                &flag,
-            );
-            runs.lock()
-                .map_err(|_| "Run lock poisoned")?
-                .remove(&run_id);
-            Ok(json!(result?))
+            // Card GET cancellation is cooperative: once it returns (even with
+            // an error), honor the intent before making any SendMessage request.
+            run.check_before_submission()?;
+            let mut client = connected?;
+            Ok(json!(
+                client.run_cancellable(
+                    message,
+                    value
+                        .get("configuration")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    &run.flag,
+                )?
+            ))
         }
         _ => Err("not found".into()),
     }
@@ -125,26 +159,38 @@ pub fn serve() -> Result<()> {
     println!("{}", server.server_addr());
     let runs = std::sync::Arc::new(Runs::default());
     let workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel_workers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for request in server.incoming_requests() {
-        // Keep cancellation reachable during blocking SendMessage/polling.
-        // Only runs are concurrent; configuration mutations remain serialized.
-        if request.url() == "/api/run" {
-            if workers.load(std::sync::atomic::Ordering::SeqCst) >= 8 {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("{\"error\":\"Too many active runs\"}")
-                        .with_status_code(503),
-                );
-                continue;
-            }
-            workers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let (token, runs, workers) = (token.clone(), runs.clone(), workers.clone());
-            std::thread::spawn(move || {
-                handle_request(request, &token, &runs);
-                workers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            });
+        // Every request may block on body I/O or a URL validation. Keep the accept
+        // loop free, and reserve a separate bounded lane for cancellation even
+        // when all ordinary workers are occupied. Store locks serialize writes.
+        let (pool, limit) = if request.url() == "/api/cancel" {
+            (&cancel_workers, 4)
         } else {
-            handle_request(request, &token, &runs);
+            (&workers, 8)
+        };
+        if pool.load(std::sync::atomic::Ordering::SeqCst) >= limit {
+            let _ = request.respond(
+                tiny_http::Response::from_string("{\"error\":\"Service busy; retry later\"}")
+                    .with_status_code(503)
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+            );
+            continue;
         }
+        pool.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (token, runs, pool) = (token.clone(), runs.clone(), pool.clone());
+        std::thread::spawn(move || {
+            struct Worker(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Worker {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _worker = Worker(pool);
+            handle_request(request, &token, &runs);
+        });
     }
     Ok(())
 }

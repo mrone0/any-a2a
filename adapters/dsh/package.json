@@ -1,6 +1,6 @@
 {
   "name": "@any-a2a/dsh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "One-shot any-a2a subagent provider for the pinned DeepSeek Harness API",
   "type": "module",

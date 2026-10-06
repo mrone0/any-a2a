@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -20,6 +20,18 @@ pub struct StoredAgent {
     #[serde(default)]
     pub card_url: Option<String>,
     #[serde(default, skip_serializing)]
+    pub auth: crate::auth::Auth,
+}
+/// A local catalog record. Legacy URL records may have no saved Card metadata.
+/// Reading this type never contacts the remote URL or invents CardInfo fields.
+#[derive(Serialize, Clone)]
+pub struct CatalogAgent {
+    pub id: String,
+    pub raw: Option<Value>,
+    pub info: Option<CardInfo>,
+    pub source: String,
+    pub card_url: Option<String>,
+    #[serde(skip_serializing)]
     pub auth: crate::auth::Auth,
 }
 #[derive(Serialize)]
@@ -64,15 +76,7 @@ fn preview_authenticated(
     token: Option<String>,
     auth: &crate::auth::Auth,
 ) -> Result<Preview> {
-    let url = reqwest::Url::parse(url).map_err(|_| "Invalid source URL")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("Use an HTTP(S) URL without credentials, query or fragment; supply credentials in Token".into());
-    }
+    let url = validate_card_url(url)?;
     let client = reqwest::blocking::Client::builder()
         .default_headers(auth.headers()?)
         .redirect(reqwest::redirect::Policy::none())
@@ -95,8 +99,6 @@ fn preview_authenticated(
     if bytes.len() as u64 > LIMIT {
         return Err("Directory exceeds 8 MiB".into());
     }
-    // A URL normally returns one Agent Card object. Keep array parsing only as
-    // backwards-compatible support for the old bulk-preview endpoint.
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|_| "Agent Card is not valid JSON")?;
     if value.is_object() {
@@ -108,6 +110,97 @@ fn preview_authenticated(
         });
     }
     parse_directory(&bytes)
+}
+
+/// Shared by persistence, desktop validation and explicit remote refresh.
+pub fn validate_card_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "Invalid source URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Use an HTTP(S) URL without credentials, query or fragment; supply credentials in Token".into());
+    }
+    Ok(url)
+}
+
+/// Validate the same bounded JSONL schema for every reader and writer, without HTTP.
+pub fn validate_store_text(text: &str) -> Result<()> {
+    parse_store_text(text).map(|_| ())
+}
+
+pub fn parse_store_text(text: &str) -> Result<std::collections::BTreeMap<String, Value>> {
+    if text.len() > crate::catalog_store::MAX_STORE_BYTES {
+        return Err("Configuration exceeds 8 MiB".into());
+    }
+    let mut records = std::collections::BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let check = || -> Result<(String, Value)> {
+            let record: Value = serde_json::from_str(line).map_err(|_| "Invalid JSON")?;
+            let id = record["id"]
+                .as_str()
+                .filter(|id| {
+                    !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                })
+                .ok_or("Invalid or missing Agent id")?
+                .to_owned();
+            if record
+                .get("deleted")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err("deleted must be a boolean".into());
+            }
+            Ok((id, record))
+        };
+        let (id, record) = check().map_err(|error| format!("第 {} 行：{error}", index + 1))?;
+        if record["deleted"] == true {
+            records.remove(&id);
+        } else {
+            records.insert(id, (index + 1, record));
+        }
+    }
+    // Historical revisions may already have been explicitly deleted or superseded.
+    // Validate their JSON/id, and only validate the effective Card/auth payloads.
+    records
+        .into_iter()
+        .map(|(id, (line, record))| {
+            let check = || -> Result<()> {
+                match record["source"].as_str() {
+                    Some("manual") => {
+                        if record.get("cardUrl").is_some_and(|value| !value.is_null()) {
+                            return Err("Manual Agent cannot contain cardUrl".into());
+                        }
+                        inspect_card(&record["agentCard"])?;
+                    }
+                    Some("url") => {
+                        validate_card_url(record["cardUrl"].as_str().ok_or("Missing cardUrl")?)?;
+                        // Optional last-known Card metadata can coexist with a URL source.
+                        if let Some(card) = record.get("agentCard") {
+                            inspect_card(card)?;
+                        }
+                    }
+                    _ => return Err("source must be url or manual".into()),
+                }
+                let auth: crate::auth::Auth = serde_json::from_value(
+                    record
+                        .get("auth")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(|_| "Invalid authentication")?;
+                auth.headers()?;
+                Ok(())
+            };
+            check().map_err(|error| format!("第 {line} 行：{error}"))?;
+            Ok((id, record))
+        })
+        .collect()
 }
 
 pub fn parse_directory(bytes: &[u8]) -> Result<Preview> {
@@ -160,7 +253,7 @@ pub fn append_authenticated(
     auth: crate::auth::Auth,
 ) -> Result<StoredAgent> {
     auth.headers()?;
-    if id.trim().is_empty() || id.contains('\n') {
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
         return Err("Invalid agent id".into());
     }
     if source != "url" && source != "manual" {
@@ -188,29 +281,8 @@ pub fn append_authenticated(
         card_url: card_url.clone(),
         auth,
     };
-    let dir = data_dir()?;
-    fs::create_dir_all(&dir).map_err(|_| "Cannot create data directory")?;
-    let path = dir.join("agent-cards.jsonl");
-    let mut options = fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
-        if path.exists() {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(|_| "Cannot protect credential file")?;
-        }
-    }
-    let mut file = options.open(path).map_err(|_| "Cannot open card store")?;
     let record = json_record(&item, card_url);
-    writeln!(
-        file,
-        "{}",
-        serde_json::to_string(&record).map_err(|_| "Cannot serialize card")?
-    )
-    .map_err(|_| "Cannot append card")?;
-    file.sync_all().map_err(|_| "Cannot persist card")?;
+    crate::catalog_store::Store::at(data_dir()?).append_records(&[record])?;
     Ok(item)
 }
 
@@ -224,46 +296,34 @@ fn json_record(item: &StoredAgent, card_url: Option<String>) -> Value {
     );
     if let Some(url) = card_url {
         record.insert("cardUrl".into(), Value::String(url));
-    } else {
-        record.insert("agentCard".into(), item.raw.clone());
     }
+    record.insert("agentCard".into(), item.raw.clone());
     Value::Object(record)
 }
 
-pub fn list_agents() -> Result<Vec<StoredAgent>> {
+/// List local records and saved metadata without checking remote availability.
+pub fn list_agents() -> Result<Vec<CatalogAgent>> {
     read_agents(None)
 }
 
-/// Resolve only the selected agent so unrelated unavailable URLs cannot block a run.
-pub fn get_agent(id: &str) -> Result<StoredAgent> {
+/// Read the selected local record; the caller connects only this Agent when executing.
+pub fn get_agent(id: &str) -> Result<CatalogAgent> {
     read_agents(Some(id))?
         .into_iter()
         .next()
         .ok_or("Agent not found in local catalog".into())
 }
 
-fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
-    let path = data_dir()?.join("agent-cards.jsonl");
-    let bytes = match fs::read(path) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(_) => return Err("Cannot read card store".into()),
-    };
-    // Fold revisions before resolving URLs: deleted/unavailable remote cards must not block listing.
-    let mut records = std::collections::BTreeMap::new();
-    for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let v: Value = serde_json::from_slice(line)
-            .map_err(|_| "Card store contains invalid JSON".to_string())?;
-        let id = v["id"]
-            .as_str()
-            .ok_or("Card record missing id")?
-            .to_string();
-        if v["deleted"] == true {
-            records.remove(&id);
-        } else {
-            records.insert(id, v);
-        }
-    }
+fn read_agents(selected: Option<&str>) -> Result<Vec<CatalogAgent>> {
+    let text = crate::catalog_store::Store::at(data_dir()?).read_text()?;
+    let records = parse_store_text(&text)?;
+    catalog_records(records, selected)
+}
+
+fn catalog_records(
+    records: std::collections::BTreeMap<String, Value>,
+    selected: Option<&str>,
+) -> Result<Vec<CatalogAgent>> {
     let mut result = Vec::new();
     for (id, v) in records {
         if selected.is_some_and(|selected| selected != id) {
@@ -276,21 +336,9 @@ fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
                 .unwrap_or_else(|| serde_json::json!({})),
         )
         .map_err(|_| "Invalid stored authentication")?;
-        let raw = if let Some(card) = v.get("agentCard") {
-            card.clone()
-        } else if let Some(url) = v["cardUrl"].as_str() {
-            let preview = preview_authenticated(url, None, &auth)?;
-            preview
-                .agents
-                .into_iter()
-                .next()
-                .ok_or("URL did not return an Agent Card")?
-                .raw
-        } else {
-            return Err("Card record missing agentCard or cardUrl".into());
-        };
-        let info = inspect_card(&raw)?;
-        let item = StoredAgent {
+        let raw = v.get("agentCard").cloned();
+        let info = raw.as_ref().map(inspect_card).transpose()?;
+        let item = CatalogAgent {
             id: id.clone(),
             raw,
             info,
@@ -298,27 +346,16 @@ fn read_agents(selected: Option<&str>) -> Result<Vec<StoredAgent>> {
             card_url: v["cardUrl"].as_str().map(str::to_owned),
             auth,
         };
-        if let Some(old) = result.iter_mut().find(|a: &&mut StoredAgent| a.id == id) {
-            *old = item;
-        } else {
-            result.push(item);
-        }
+        result.push(item);
     }
     Ok(result)
 }
 pub fn delete_agent(id: &str) -> Result<()> {
-    if id.trim().is_empty() || id.len() > 256 {
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
         return Err("Invalid agent id".into());
     }
-    let path = data_dir()?.join("agent-cards.jsonl");
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|_| "Cannot open card store")?;
-    let record = format!("{}\n", serde_json::json!({"id":id,"deleted":true}));
-    file.write_all(record.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|_| "Cannot persist deletion".into())
+    crate::catalog_store::Store::at(data_dir()?)
+        .append_records(&[serde_json::json!({"id":id,"deleted":true})])
 }
 
 fn read_catalog(dir: &Path) -> Result<Vec<StoredAgent>> {
@@ -405,28 +442,7 @@ fn import_at(dir: &Path, cards: Vec<Value>, source: &str) -> Result<Vec<StoredAg
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts
-            .open(&tmp)
-            .map_err(|_| "Cannot create temporary file")?;
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "Cannot persist temporary file")?;
-        fs::rename(&tmp, path).map_err(|_| "Cannot atomically replace local file")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
+    crate::catalog_store::atomic_write(path, bytes)
 }
 
 pub use crate::install::{install_dsh, uninstall_dsh};
@@ -434,6 +450,111 @@ pub use crate::install::{install_dsh, uninstall_dsh};
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn manual() -> Value {
+        serde_json::json!({"id":"fixture","source":"manual","agentCard":{
+            "name":"Fixture","description":"test","version":"1","protocolVersion":"0.3.0",
+            "url":"http://127.0.0.1:1/rpc","capabilities":{},"defaultInputModes":["text"],
+            "defaultOutputModes":["text"],"skills":[]
+        }})
+    }
+    #[test]
+    fn local_catalog_keeps_uncached_url_records_without_fabricating_metadata() {
+        let legacy = serde_json::json!({"id":"legacy-url","source":"url","cardUrl":"http://127.0.0.1:1/card","auth":{"bearerToken":"fixture-only-secret"}});
+        let text = format!("{}\n{legacy}\n", manual());
+        let records = parse_store_text(&text).unwrap();
+        let agents = catalog_records(records.clone(), None).unwrap();
+        assert_eq!(agents.len(), 2);
+        let old = agents
+            .iter()
+            .find(|agent| agent.id == "legacy-url")
+            .unwrap();
+        assert!(old.info.is_none());
+        assert!(old.raw.is_none());
+        assert_eq!(old.card_url.as_deref(), Some("http://127.0.0.1:1/card"));
+        let serialized = serde_json::to_value(old).unwrap();
+        assert!(serialized["info"].is_null());
+        assert!(serialized["raw"].is_null());
+        assert!(serialized.get("auth").is_none());
+        assert!(!serialized.to_string().contains("fixture-only-secret"));
+        let selected = catalog_records(records, Some("fixture")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].info.as_ref().unwrap().name, "Fixture");
+    }
+
+    #[test]
+    fn url_serialization_preserves_validated_card_metadata_locally() {
+        let raw = manual()["agentCard"].clone();
+        let item = StoredAgent {
+            id: "cached-url".into(),
+            info: inspect_card(&raw).unwrap(),
+            raw: raw.clone(),
+            source: "url".into(),
+            card_url: Some("http://127.0.0.1:1/card".into()),
+            auth: crate::auth::Auth::default(),
+        };
+        let record = json_record(&item, item.card_url.clone());
+        assert_eq!(record["agentCard"], raw);
+        assert_eq!(record["cardUrl"], "http://127.0.0.1:1/card");
+        let agents = catalog_records(parse_store_text(&record.to_string()).unwrap(), None).unwrap();
+        assert_eq!(agents[0].raw.as_ref().unwrap(), &raw);
+        assert_eq!(agents[0].info.as_ref().unwrap().name, "Fixture");
+    }
+
+    #[test]
+    fn invalid_cached_card_is_rejected_without_remote_repair() {
+        let record = serde_json::json!({"id":"bad-cache","source":"url","cardUrl":"http://127.0.0.1:1/card","agentCard":{}});
+        assert!(parse_store_text(&record.to_string()).is_err());
+    }
+    #[test]
+    fn shared_store_parser_accepts_whitespace_crlf_and_revisions() {
+        let mut revised = manual();
+        revised["agentCard"]["name"] = serde_json::json!("Updated");
+        let text = format!(" \t\r\n{}\r\n\t\n{}\n", manual(), revised);
+        validate_store_text(&text).unwrap();
+        let records = parse_store_text(&text).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records["fixture"]["agentCard"]["name"], "Updated");
+        let deleted = format!("{text}{{\"id\":\"fixture\",\"deleted\":true}}\n");
+        assert!(parse_store_text(&deleted).unwrap().is_empty());
+    }
+    #[test]
+    fn editor_and_runtime_reject_the_same_url_and_record_errors() {
+        for url in [
+            "https://example.test/card?token=private",
+            "https://example.test/card#fragment",
+            "https://user:private@example.test/card",
+        ] {
+            let record = serde_json::json!({"id":"url","source":"url","cardUrl":url});
+            let error = validate_store_text(&record.to_string()).unwrap_err();
+            assert!(error.contains("第 1 行"));
+            assert!(!error.contains("private"));
+        }
+        let mut record = manual();
+        record["source"] = serde_json::json!("unknown");
+        assert!(validate_store_text(&record.to_string()).is_err());
+        record = manual();
+        record["cardUrl"] = serde_json::json!("https://example.test/card");
+        assert!(validate_store_text(&record.to_string()).is_err());
+        record = manual();
+        record["id"] = serde_json::json!("line\nbreak");
+        assert!(validate_store_text(&record.to_string()).is_err());
+        record = manual();
+        record["deleted"] = serde_json::json!("true");
+        assert!(validate_store_text(&record.to_string()).is_err());
+        record = manual();
+        record["auth"] = serde_json::json!({"headers":{"Host":"private"}});
+        assert!(validate_store_text(&record.to_string()).is_err());
+    }
+    #[test]
+    fn explicitly_deleted_bad_payload_is_not_resolved() {
+        assert!(
+            parse_store_text(
+                "{\"id\":\"old\",\"source\":\"broken\"}\n{\"id\":\"old\",\"deleted\":true}\n"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
     #[test]
     fn empty_is_noop() {
         assert!(parse_directory(b" \n").unwrap().empty);

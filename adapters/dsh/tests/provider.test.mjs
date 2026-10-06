@@ -6,8 +6,9 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as plugin from '../src/index.js'
 
-const executable = fileURLToPath(new URL('./fixture-cli.mjs', import.meta.url))
-const config = { cardUrl: 'https://example.test/card', executable }
+const executable = process.execPath
+const executableArgs = [fileURLToPath(new URL('./fixture-cli.mjs', import.meta.url))]
+const config = { cardUrl: 'https://example.test/card', executable, args: executableArgs }
 const request = (text, signal = new AbortController().signal) => ({ prompt: [{ type: 'text', text }], signal })
 async function outcome(text, options = {}) {
   const run = await plugin.createProvider({ ...config, ...options }).start(request(text))
@@ -38,7 +39,7 @@ test('argument transport preserves shell metacharacters, Unicode, and text block
 
 test('multiple cached cards retain independent names and literal --card-file argv', async () => {
   for (const [providerName, cardFile] of [['card-one', '/tmp/one card;$(touch nope).json'], ['card-two', '/tmp/世界.json']]) {
-    const provider = plugin.createProvider({ providerName, cardFile, executable })
+    const provider = plugin.createProvider({ providerName, cardFile, executable, args: executableArgs })
     assert.equal(provider.name, providerName)
     const run = await provider.start(request('args'))
     try {

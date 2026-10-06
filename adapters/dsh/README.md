@@ -12,7 +12,9 @@ DSH -> any-a2a run --agent-id ID -> remote A2A Agent
 
 The desktop app is not in this execution path. Closing it or its private service does not interrupt DSH calls. The CLI reads the selected saved agent and its authentication for each invocation; credentials are not copied into the DSH patch. Capability hints refresh through `any-a2a catalog`, whose output omits stored authentication fields. Treat catalog metadata as private, untrusted data nonetheless.
 
-Keep the executable, adapter source, and catalog paths valid and readable by the DSH user. Rebuild the CLI before applying new configurations. Moving the checkout requires updating paths. No background daemon or GUI autostart is required.
+Desktop embeds the adapter and stages its runtime files, shared dependencies and native CLI into a persistent version directory. Desktop-generated paths do not depend on a source checkout or the running desktop process. Keep the staged directory and catalog readable by the DSH user; existing versions are retained when desktop is updated. Source-based manual configurations still require their configured paths to remain valid. No background daemon or GUI autostart is required.
+
+Desktop tool names use an ASCII-normalized Agent name with a base of at most 48 characters, or `remote_agent_<index>` when the name has no usable characters. Existing string `toolName` values found recursively in the selected JSON patch and DSH's reserved `run_code` name are occupied first; collisions receive `_2`, `_3`, and later suffixes until unique. Final names stay within this project's 64-character interoperability ceiling. The same ordered catalog and patch produce the same tool names, and each generated provider/tool pair shares its allocated name. Tools registered dynamically or in other profile layers cannot be discovered from this patch; verify those names and preset permissions in DSH before activation.
 
 Existing `serviceUrl`/`serviceToken` configurations remain compatible but still depend on that service. They are **not migrated automatically**: back up your DSH patch, remove only the old any-a2a-owned provider/tool entries, then apply again from the app and restart DSH. Do not delete unrelated configuration. Existing DSH preset permissions still need verification.
 
@@ -71,7 +73,8 @@ For explicit composition the plugin config accepts:
 | `dataDir` | Absolute catalog directory for CLI mode; optional platform default. |
 | `providerName` | Registry name, default `any-a2a`; use distinct names for multiple cards. |
 | `executable` | Executable path or PATH name, default `any-a2a`; not a shell command. |
-| `maxOutputBytes` | Positive safe integer; stdout buffer ceiling, default 1 MiB. |
+| `maxOutputBytes` | Positive safe integer; stdout ceiling, default and hard maximum 20 MiB. Smaller explicit budgets remain effective. |
+| `args` | Optional trusted static launcher arguments, chiefly for native Node.js test fixtures; not exposed to the model. Production deployments should use the native Rust CLI directly. |
 
 ## Execution and security
 
@@ -83,7 +86,7 @@ CLI success must be one JSON object containing `text` (string), `task_id` and `c
 
 `run.id` is a fresh DSH remote-run identity, **not** an A2A task ID. A2A task/context IDs are validated but not exposed through DSH's one-shot result, which has no metadata slot. No local Agent, durable child session, catalog entry, resumable context, or send-message operation is created.
 
-Abort or `dispose()` forcibly kills the direct CLI process with SIGKILL and waits for its `close` event. Disposal is idempotent. **Local cancellation, timeout, or process kill does not send A2A remote cancellation; the remote task can continue.** There is no adapter-owned timeout or process-tree management. Use the native Rust executable directly, not a wrapper that spawns descendants. Protocol version support, same-origin card endpoint checks, polling and timeout policy belong to the CLI (A2A 1.0 JSON-RPC, with A2A 0.3.0 JSON-RPC fallback). There is no token streaming or automatic retry.
+Abort or `dispose()` forcibly kills the direct CLI process with SIGKILL and waits for its `close` event. Disposal is idempotent. **Local cancellation, timeout, or process kill does not send A2A remote cancellation; the remote task can continue.** The shared CLI transport applies a 125-second deadline and bounded framing. There is no process-tree management. Use the native Rust executable directly, not a wrapper that spawns descendants. Protocol version support, same-origin card endpoint checks, polling and timeout policy belong to the CLI (A2A 1.0 JSON-RPC, with A2A 0.3.0 JSON-RPC fallback). There is no token streaming or automatic retry.
 
 ## Tests
 

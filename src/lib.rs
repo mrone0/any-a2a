@@ -1,10 +1,13 @@
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub mod auth;
 pub mod catalog;
+pub mod catalog_store;
 pub mod install;
 pub mod service;
+mod trace;
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -12,32 +15,19 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, String>;
-thread_local! { static REQUEST_TRACE: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) }; }
 pub fn take_request_trace() -> Vec<Value> {
-    REQUEST_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+    trace::take()
 }
-thread_local! { static STREAM_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// Opt-in CLI event stream; never enabled by the desktop service.
 pub fn enable_trace_stream() {
-    STREAM_TRACE.with(|enabled| enabled.set(true));
+    trace::enable_stream();
 }
 fn trace(value: Value) {
-    STREAM_TRACE.with(|enabled| {
-        if enabled.get() {
-            use std::io::Write;
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(stdout, "{}", json!({"event":"progress","data":value}));
-            let _ = stdout.flush();
-        }
-    });
-    REQUEST_TRACE.with(|t| {
-        let mut t = t.borrow_mut();
-        if t.len() < 200 {
-            t.push(value);
-        }
-    });
+    trace::event(value);
 }
 const MAX_RESPONSE: u64 = 4 * 1024 * 1024;
+const MAX_TOTAL_RESPONSE: u64 = 64 * 1024 * 1024;
+pub const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct Outcome {
@@ -47,6 +37,43 @@ pub struct Outcome {
     pub task_id: Option<String>,
     pub context_id: Option<String>,
     pub state: String,
+    pub progress_truncated: bool,
+}
+
+/// Serialize one final CLI frame with an explicit producer-side byte limit.
+pub fn serialize_outcome(outcome: &Outcome, events: bool) -> Result<Vec<u8>> {
+    struct Output(Vec<u8>);
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_RESULT_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("Final result exceeds 16 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[derive(Serialize)]
+    struct Event<'a> {
+        event: &'static str,
+        data: &'a Outcome,
+    }
+    let mut output = Output(Vec::new());
+    let result = if events {
+        serde_json::to_writer(
+            &mut output,
+            &Event {
+                event: "result",
+                data: outcome,
+            },
+        )
+    } else {
+        serde_json::to_writer(&mut output, outcome)
+    };
+    result.map_err(|_| "Final result exceeds 16 MiB or cannot be serialized; remote task may already have completed")?;
+    Ok(output.0)
 }
 
 /// Normalized, supported JSON-RPC interface. `version` is the protocol version,
@@ -209,6 +236,7 @@ pub struct A2aClient {
     sequence: u64,
     version: String,
     tenant: Option<String>,
+    response_budget: u64,
 }
 
 fn validate_url(raw: &str) -> Result<Url> {
@@ -228,18 +256,30 @@ fn validate_url(raw: &str) -> Result<Url> {
 }
 
 fn read_json(response: reqwest::blocking::Response) -> Result<Value> {
+    let mut budget = MAX_RESPONSE;
+    read_json_bounded(response, &mut budget)
+}
+
+fn read_json_bounded(response: reqwest::blocking::Response, budget: &mut u64) -> Result<Value> {
     let status = response.status();
     if !status.is_success() {
         return Err(format!("HTTP error {status}"));
     }
     let mut bytes = Vec::new();
+    let available = MAX_RESPONSE.min(*budget);
     response
-        .take(MAX_RESPONSE + 1)
+        .take(available + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "Response read failed")?;
-    if bytes.len() as u64 > MAX_RESPONSE {
-        return Err("Response exceeds 4 MiB limit".into());
+    if bytes.len() as u64 > available {
+        return Err(if available < MAX_RESPONSE {
+            "Cumulative response budget exceeded; remote task may still be running"
+        } else {
+            "Response exceeds 4 MiB limit"
+        }
+        .into());
     }
+    *budget -= bytes.len() as u64;
     serde_json::from_slice(&bytes).map_err(|_| "Invalid JSON response".into())
 }
 
@@ -284,6 +324,7 @@ impl A2aClient {
             sequence: 0,
             version: info.version,
             tenant,
+            response_budget: MAX_TOTAL_RESPONSE,
         })
     }
 
@@ -316,10 +357,14 @@ impl A2aClient {
             sequence: 0,
             version: info.version,
             tenant,
+            response_budget: MAX_TOTAL_RESPONSE,
         })
     }
 
     fn rpc(&mut self, method: &str, mut params: Value) -> Result<Value> {
+        if self.sequence >= 1024 || self.response_budget == 0 {
+            return Err("RPC/response budget exceeded; remote task may still be running".into());
+        }
         let started = Instant::now();
         trace(
             json!({"stage":"request", "method":method, "origin":self.endpoint.origin().ascii_serialization(), "protocol":self.version, "parameterKeys":params.as_object().map(|p| p.keys().collect::<Vec<_>>()), "authenticated":self.token.is_some()}),
@@ -345,7 +390,7 @@ impl A2aClient {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        let body = read_json(request.send().map_err(|error| {
+        let response = request.send().map_err(|error| {
             // Never expose reqwest's raw error: it can include credential-bearing URLs.
             let reason = if error.is_timeout() {
                 "request timed out (请求超时)"
@@ -356,9 +401,10 @@ impl A2aClient {
             };
             trace(json!({"stage":"transport_error","method":method,"elapsedMs":started.elapsed().as_millis(),"reason":reason}));
             format!("A2A {method}: {reason}; remote task may still be running; 未自动重试")
-        })?)?;
+        })?;
+        let body = read_json_bounded(response, &mut self.response_budget)?;
         trace(
-            json!({"stage":"response","method":method,"elapsedMs":started.elapsed().as_millis(),"rpcErrorCode":body.get("error").and_then(|e| e.get("code"))}),
+            json!({"stage":"response","method":method,"elapsedMs":started.elapsed().as_millis(),"rpcErrorCode":body.get("error").and_then(|e| e.get("code")).and_then(Value::as_i64)}),
         );
         if body["jsonrpc"] != "2.0" || body["id"] != self.sequence {
             return Err("Invalid JSON-RPC envelope or response ID".into());
@@ -367,6 +413,9 @@ impl A2aClient {
             return Err("Invalid JSON-RPC envelope: both result and error".into());
         }
         if let Some(error) = body.get("error") {
+            let code = error["code"]
+                .as_i64()
+                .ok_or("Invalid JSON-RPC error code")?;
             let hint = if error["code"].as_i64() == Some(-32602) {
                 "；远端拒绝请求参数"
             } else {
@@ -380,7 +429,7 @@ impl A2aClient {
             // Remote error.data can contain prompts or credentials; do not relay it blindly.
             return Err(format!(
                 "A2A {method}: JSON-RPC error code {}{hint}{lifecycle}",
-                error["code"]
+                code
             ));
         }
         body.get("result")
@@ -411,6 +460,7 @@ impl A2aClient {
         configuration: Value,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Outcome> {
+        trace::reset();
         let configuration = validate_configuration(&self.version, configuration)?;
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("发送前已停止；未提交远程任务".into());
@@ -450,7 +500,7 @@ impl A2aClient {
         } else {
             value["kind"].as_str().unwrap_or("").to_owned()
         };
-        let mut last_status_message = String::new();
+        let mut last_status_digest: Option<[u8; 32]> = None;
         loop {
             match Some(kind.as_str()) {
                 Some("message") => {
@@ -460,6 +510,7 @@ impl A2aClient {
                         task_id: None,
                         context_id: string(&value, "contextId"),
                         state: "completed".into(),
+                        progress_truncated: trace::truncated(),
                     });
                 }
                 Some("task") => {}
@@ -484,10 +535,17 @@ impl A2aClient {
             };
             trace(json!({"stage":"task","taskId":task_id,"state":state}));
             let status_message = parts_text(&value["status"]["message"], v1);
-            if !status_message.is_empty() && status_message != last_status_message {
+            let status_digest: [u8; 32] = Sha256::digest(status_message.as_bytes()).into();
+            if !status_message.is_empty() && Some(status_digest) != last_status_digest {
                 // Remote content is untrusted output, never a local instruction.
-                trace(json!({"stage":"remote_status","taskId":task_id,"text":status_message}));
-                last_status_message = status_message;
+                let truncated = status_message.len() > 8192;
+                if truncated {
+                    trace::mark_truncated();
+                }
+                trace(
+                    json!({"stage":"remote_status","taskId":task_id,"text":trace::bounded_text(&status_message,8192),"textTruncated":truncated}),
+                );
+                last_status_digest = Some(status_digest);
             }
             match state {
                 "completed" | "canceled" => {
@@ -497,15 +555,22 @@ impl A2aClient {
                         task_id: Some(task_id),
                         context_id: string(&value, "contextId"),
                         state: state.into(),
+                        progress_truncated: trace::truncated(),
                     });
                 }
                 "failed" | "rejected" | "input-required" | "auth-required" => {
                     return Err(format!(
-                        "Remote task {task_id} ended/paused in state {state}; continuation is not supported by this prototype"
+                        "Remote task {} ended/paused in state {state}; continuation is not supported by this prototype",
+                        trace::bounded_text(&task_id, 256)
                     ));
                 }
                 "submitted" | "working" => {}
-                _ => return Err(format!("Unsupported task state {state}")),
+                _ => {
+                    return Err(format!(
+                        "Unsupported task state {}",
+                        trace::bounded_text(state, 200)
+                    ));
+                }
             }
             if cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 // Give cancellation its own bounded deadline, even if polling
@@ -530,12 +595,14 @@ impl A2aClient {
                 {
                     return Err("取消未确认：远端未返回 canceled 状态；任务可能已完成或仍在运行，请查询远端状态".into());
                 }
+                trace(json!({"stage":"task","taskId":task_id,"state":"canceled"}));
                 return Ok(Outcome {
                     text: task_text(&canceled, v1),
                     task_id: Some(task_id),
                     context_id: string(&canceled, "contextId"),
                     state: "canceled".into(),
                     raw: canceled,
+                    progress_truncated: trace::truncated(),
                 });
             }
             let remaining = self
@@ -543,7 +610,8 @@ impl A2aClient {
                 .checked_duration_since(Instant::now())
                 .ok_or_else(|| {
                     format!(
-                        "Deadline exceeded for task {task_id}; remote task may still be running"
+                        "Deadline exceeded for task {}; remote task may still be running",
+                        trace::bounded_text(&task_id, 256)
                     )
                 })?;
             std::thread::sleep(Duration::from_millis(200).min(remaining));
@@ -613,4 +681,82 @@ fn task_text(value: &Value, v1: bool) -> String {
         })
         .map(|message| parts_text(message, v1))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn final_frame_preserves_large_text_and_raw_without_cloning() {
+        let text = "汉".repeat(1024 * 1024);
+        let outcome = Outcome {
+            raw: json!({"kind":"message","parts":[{"kind":"text","text":text}]}),
+            text: text.clone(),
+            task_id: None,
+            context_id: None,
+            state: "completed".into(),
+            progress_truncated: true,
+        };
+        let frame = serialize_outcome(&outcome, true).unwrap();
+        assert!(frame.len() < MAX_RESULT_BYTES);
+        let decoded: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(decoded["data"]["raw"], outcome.raw);
+        assert_eq!(decoded["data"]["text"], text);
+        assert_eq!(decoded["data"]["progress_truncated"], true);
+    }
+
+    #[test]
+    fn oversize_final_frame_is_rejected_by_bounded_writer() {
+        let outcome = Outcome {
+            raw: Value::Null,
+            text: "x".repeat(MAX_RESULT_BYTES),
+            task_id: None,
+            context_id: None,
+            state: "completed".into(),
+            progress_truncated: false,
+        };
+        assert!(
+            serialize_outcome(&outcome, true)
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+    }
+
+    #[test]
+    fn response_reader_enforces_remaining_total_budget() {
+        use std::{io::Write, net::TcpListener, thread};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let body = "{\"text\":\"larger than remaining budget\"}";
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let response = Client::new()
+            .get(endpoint)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .unwrap();
+        let mut remaining = 8;
+        let error = read_json_bounded(response, &mut remaining).unwrap_err();
+        assert!(error.contains("Cumulative response budget exceeded"));
+        assert!(!error.contains("larger than remaining"));
+        worker.join().unwrap();
+    }
 }

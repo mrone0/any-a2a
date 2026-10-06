@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "any-a2a"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -55,12 +55,13 @@ dependencies = [
 
 [[package]]
 name = "any-a2a-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "any-a2a",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "uuid",

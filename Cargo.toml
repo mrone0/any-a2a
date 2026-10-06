@@ -1,7 +1,8 @@
 [package]
 name = "any-a2a"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+rust-version = "1.89"
 description = "Small A2A client with a DeepSeek Harness subagent provider"
 license = "MIT"
 

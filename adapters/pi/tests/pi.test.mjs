@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve, join } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { createServer } from 'node:http'
 import { deployment, executeCli, progressText } from '../transport.mjs'
+import { assertFixtureChild, removeFixtureDirectory } from './temp-dir.mjs'
 
 test('deployment strips ambient credentials; progress hides origins', () => {
   const config=deployment({PATH:'x',MODEL_API_KEY:'secret',ANY_A2A_TOKEN:'secret',ANY_A2A_EXECUTABLE:'native'})
@@ -26,7 +27,10 @@ test('actual Pi loader, native CLI, live progress, and persisted tool details ro
   const {loadExtensions}=await import(pathToFileURL(join(root,'dist/core/extensions/loader.js')).href)
   const {SessionManager}=await import(pathToFileURL(join(root,'dist/core/session-manager.js')).href)
   const dir=await mkdtemp(join(tmpdir(),'pi-a2a-'))
-  const previous={exe:process.env.ANY_A2A_EXECUTABLE,data:process.env.ANY_A2A_DATA_DIR}
+  const previous={exe:process.env.ANY_A2A_EXECUTABLE,data:process.env.ANY_A2A_DATA_DIR,agent:process.env.PI_CODING_AGENT_DIR}
+  const isolatedAgentDir=join(dir,'agent')
+  await mkdir(isolatedAgentDir)
+  process.env.PI_CODING_AGENT_DIR=isolatedAgentDir
   process.env.ANY_A2A_EXECUTABLE=process.env.ANY_A2A_TEST_BINARY||fileURLToPath(new URL('../../../target/demo-build/debug/any-a2a'+(process.platform==='win32'?'.exe':''),import.meta.url))
   process.env.ANY_A2A_DATA_DIR=dir
   let runDirectory
@@ -86,8 +90,12 @@ test('actual Pi loader, native CLI, live progress, and persisted tool details ro
     assert.equal(snapshot.details.record.state,'completed')
     await assert.rejects(inspect.execute('wrong',{runId:background.details.runId},undefined,undefined,{sessionManager:{getSessionId:()=> 'other-parent'}}))
   } finally {
-    await new Promise(r=>server.close(r));await rm(dir,{recursive:true,force:true})
-    if(runDirectory)await rm(runDirectory,{recursive:true,force:true})
-    for(const [key,value]of [['ANY_A2A_EXECUTABLE',previous.exe],['ANY_A2A_DATA_DIR',previous.data]])if(value===undefined)delete process.env[key];else process.env[key]=value
+    await new Promise(r=>server.close(r))
+    try {
+      if(runDirectory && await stat(runDirectory).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error}))await assertFixtureChild(isolatedAgentDir,runDirectory)
+      await removeFixtureDirectory(dir,'pi-a2a-')
+    }finally{
+      for(const [key,value]of [['ANY_A2A_EXECUTABLE',previous.exe],['ANY_A2A_DATA_DIR',previous.data],['PI_CODING_AGENT_DIR',previous.agent]])if(value===undefined)delete process.env[key];else process.env[key]=value
+    }
   }
 })

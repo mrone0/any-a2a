@@ -13,6 +13,11 @@ test('capabilities refresh every assembly and removed cards are not advertised',
     assert.match(await assemble(), /old/)
     cards[0].info.description='updated skills'
     assert.match(await assemble(), /updated skills/)
+    assert.match(await assemble(), /locally saved Agent Card metadata/)
+    cards=[{id:'one',info:null,raw:null,source:'url'}]
+    const unknown = await assemble()
+    assert.match(unknown, /no locally cached Agent Card metadata/)
+    assert.doesNotMatch(unknown, /advertised capabilities/)
     cards=[]
     assert.match(await assemble(), /no longer/)
   } finally { server.closeAllConnections(); await new Promise(r=>server.close(r)) }

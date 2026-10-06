@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { executeCli as executeCommonCli, CliTransportError } from '../common/src/cli-transport.js'
 import { isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync } from 'node:fs'
@@ -20,65 +20,14 @@ export function deployment(env = process.env) {
   return { executable, env: childEnv }
 }
 
-/** No shell, bounded stdout, drained but undisclosed stderr; settle after process close. */
-export function executeCli(args, { signal, onProgress, timeoutMs = 125000, config = deployment() } = {}) {
-  if (signal?.aborted) throw Error('Local delegation stopped before CLI launch; no request submitted by this invocation.')
-  return new Promise((resolve, reject) => {
-    let failure, total = 0, pending = '', stdout = '', final, closed = false
-    let lastStage = 'not observed', lastState = 'unknown'
-    let transportFailed = false
-    const decoder = new TextDecoder()
-    const events = args.includes('--events')
-    let child
-    try { child = spawn(config.executable, args, {shell:false, windowsHide:true, env:config.env, stdio:['ignore','pipe','pipe']}) }
-    catch { reject(Error('Cannot start any-a2a CLI')); return }
-    const stop = message => { failure ||= message; if (!closed) child.kill('SIGKILL') }
-    const abort = () => stop('Local delegation stopped; remote task may still be running. Remote cancellation was NOT confirmed.')
-    const timer = setTimeout(() => stop('CLI deadline exceeded; remote task may still be running. No automatic retry.'), timeoutMs)
-    const consume = text => {
-      pending += text
-      let end
-      while ((end = pending.indexOf('\n')) >= 0) {
-        const line = pending.slice(0,end); pending = pending.slice(end+1)
-        if (!line.trim()) continue
-        try {
-          const value = JSON.parse(line)
-          if (value.event === 'progress' && value.data && final === undefined) {
-            // Only fixed diagnostic vocabulary; never disclose raw stderr or remote instructions.
-            if (['request','response','task','remote_status','transport_error'].includes(value.data.stage)) lastStage = value.data.stage
-            if (['submitted','working','completed','failed','canceled','rejected','input-required','auth-required'].includes(value.data.state)) lastState = value.data.state
-            if (value.data.stage === 'transport_error') transportFailed = true
-            onProgress?.(value.data)
-          }
-          else if (value.event === 'result' && final === undefined) final = value.data
-          else stop('Invalid CLI event stream')
-        } catch { stop('Invalid CLI event stream or progress handler failed') }
-      }
+/** Shared bounded process transport; this adapter only presents supported terminal results. */
+export function executeCli(args, options = {}) {
+  const pending = executeCommonCli(args, {...options, config:options.config || deployment()})
+  return pending.then(value => {
+    if (args[0] === 'run' && !['completed','canceled'].includes(value.state)) {
+      throw new CliTransportError('protocol', 'Remote task did not complete; continuation is unsupported')
     }
-    child.stdout.on('data', chunk => {
-      total += chunk.length
-      if (total > 8 * 1024 * 1024) { stop('CLI output exceeded 8 MiB; remote task may still be running'); return }
-      if (failure) return
-      const text = decoder.decode(chunk,{stream:true})
-      if (events) consume(text); else stdout += text
-    })
-    child.stderr.resume()
-    child.on('error', error => { failure ||= `Cannot start any-a2a CLI (${error.code || 'spawn error'}). Build the CLI with cargo build --release, or set ANY_A2A_EXECUTABLE to its absolute executable path and reload Pi.` })
-    child.once('close', code => {
-      closed = true; clearTimeout(timer); signal?.removeEventListener('abort',abort)
-      if (events) consume(decoder.decode()); else stdout += decoder.decode()
-      if (failure) { reject(Error(failure)); return }
-      if (code !== 0) { reject(Error(`A2A CLI exited with code ${code}; last observed stage: ${lastStage}; remote state: ${lastState}${transportFailed ? '; transport failure observed' : ''}. No automatic retry. Do not search local projects, credentials, or alternative device connections as a fallback.`)); return }
-      try {
-        if (events) {
-          if (pending.trim() || !final || typeof final.text !== 'string' || !['completed','canceled'].includes(final.state)
-            || !['task_id','context_id'].every(k=>final[k] === null || typeof final[k] === 'string')) throw Error()
-          resolve(final)
-        } else resolve(JSON.parse(stdout))
-      } catch { reject(Error('Invalid CLI response')) }
-    })
-    signal?.addEventListener('abort',abort,{once:true})
-    if (signal?.aborted) abort()
+    return value
   })
 }
 
@@ -86,6 +35,7 @@ export function progressText(event) {
   // Allowlist fields: never publish HTTP origins, headers, tokens or raw diagnostics.
   if (event.stage === 'remote_status' && typeof event.text === 'string') return `Remote progress (untrusted remote content):\n${event.text.slice(0,8000)}`
   if (event.stage === 'task' && typeof event.taskId === 'string' && typeof event.state === 'string') return `Task ${event.taskId.slice(0,200)}: ${event.state.slice(0,80)}`
+  if (event.stage === 'progress_truncated') return 'A2A progress was truncated by retention limits; final result collection continues.'
   if (event.stage === 'transport_error') return 'A2A transport failed; remote state unknown.'
   if (event.stage === 'request' && ['message/send','SendMessage','tasks/cancel','CancelTask'].includes(event.method)) return `A2A ${event.method}`
   return null

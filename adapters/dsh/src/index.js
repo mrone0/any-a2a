@@ -1,5 +1,5 @@
 /** One-shot DSH subagent provider backed by the any-a2a CLI. */
-import { spawn } from 'node:child_process'
+import { launchCli, CLI_LIMITS } from '../../common/src/cli-transport.js'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { runService } from '../../common/src/service-client.js'
@@ -12,7 +12,7 @@ export const inject = ['subagents']
 /** Validate deployment configuration before registering the provider. */
 function resolveConfig(config) {
   if (!config || typeof config !== 'object') throw new Error('any-a2a: configuration is required')
-  const allowed = new Set(['cardUrl', 'cardFile', 'serviceUrl', 'serviceToken', 'agentId', 'toolName', 'providerName', 'executable', 'dataDir', 'maxOutputBytes'])
+  const allowed = new Set(['cardUrl', 'cardFile', 'serviceUrl', 'serviceToken', 'agentId', 'toolName', 'providerName', 'executable', 'dataDir', 'maxOutputBytes', 'args'])
   for (const key of Object.keys(config)) {
     if (!allowed.has(key)) throw new Error('any-a2a: unknown configuration field')
   }
@@ -26,7 +26,8 @@ function resolveConfig(config) {
     cardFile: config.cardFile,
     providerName: config.providerName ?? 'any-a2a',
     executable: config.executable ?? 'any-a2a',
-    maxOutputBytes: config.maxOutputBytes ?? 1024 * 1024,
+    maxOutputBytes: config.maxOutputBytes ?? CLI_LIMITS.outputBytes,
+    args: config.args ?? [],
   }
   if (resolved.serviceUrl !== undefined) {
     if (resolved.cardUrl !== undefined || resolved.cardFile !== undefined) throw new Error('any-a2a: serviceUrl is mutually exclusive with cardUrl/cardFile')
@@ -56,6 +57,12 @@ function resolveConfig(config) {
   if (!Number.isSafeInteger(resolved.maxOutputBytes) || resolved.maxOutputBytes < 1) {
     throw new Error('any-a2a: maxOutputBytes must be a positive safe integer')
   }
+  if (!Array.isArray(resolved.args) || resolved.args.length > 32
+    || resolved.args.some(value => typeof value !== 'string' || value.includes('\0'))
+    || resolved.args.reduce((bytes, value) => bytes + Buffer.byteLength(value), 0) > 32 * 1024) {
+    throw new Error('any-a2a: args must be trusted executable prefix strings within 32 arguments / 32 KiB')
+  }
+  resolved.args = Object.freeze([...resolved.args])
   return Object.freeze(resolved)
 }
 
@@ -69,9 +76,7 @@ function failure(diagnostic) {
   return { output: [], stopReason: 'error', diagnostic }
 }
 
-function decode(stdout) {
-  let value
-  try { value = JSON.parse(stdout) } catch { return failure('any-a2a: invalid CLI JSON response') }
+function decode(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || typeof value.text !== 'string'
     || !['task_id', 'context_id'].every(key => value[key] === null || typeof value[key] === 'string')
@@ -134,74 +139,36 @@ export function createProvider(config) {
       }
       const cardArgs = resolved.agentId !== undefined ? ['--agent-id', resolved.agentId] : resolved.cardFile !== undefined ? ['--card-file', resolved.cardFile] : ['--card', resolved.cardUrl]
       const streaming = resolved.agentId !== undefined
-      const child = spawn(resolved.executable, ['run', ...cardArgs, ...(streaming ? ['--events'] : []), '--message', message], {
-        shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...childEnvironment(), ...(resolved.dataDir ? { ANY_A2A_DATA_DIR: resolved.dataDir } : {}) },
+      const handle = launchCli(['run', ...cardArgs, ...(streaming ? ['--events'] : []), '--message', message], {
+        signal: request.signal,
+        maxOutputBytes: resolved.maxOutputBytes,
+        onProgress: event => reportProgress(request.signal, event),
+        config: { executable: resolved.executable, args: resolved.args,
+          env: { ...childEnvironment(), ...(resolved.dataDir ? { ANY_A2A_DATA_DIR: resolved.dataDir } : {}) } },
       })
-      let aborted = false
-      let overflow = false
-      let processError = false
-      let closed = false
-      let bytes = 0
-      const chunks = []
-      let pending = ''
-      let finalValue
-      let invalidStream = false
-      const decoder = new TextDecoder()
-      const consume = text => {
-        pending += text
-        let newline
-        while ((newline = pending.indexOf('\n')) >= 0) {
-          const line = pending.slice(0, newline); pending = pending.slice(newline + 1)
-          try {
-            const event = JSON.parse(line)
-            if (event.event === 'progress') reportProgress(request.signal, event.data)
-            else if (event.event === 'result' && finalValue === undefined) finalValue = event.data
-            else invalidStream = true
-          } catch { invalidStream = true }
-        }
-      }
-      const kill = () => { if (!closed) child.kill('SIGKILL') }
-      const abort = () => { aborted = true; kill() }
-      child.stdout.on('data', chunk => {
-        bytes += chunk.length
-        if (bytes > resolved.maxOutputBytes) { overflow = true; kill() }
-        else if (streaming) consume(decoder.decode(chunk, {stream:true}))
-        else chunks.push(chunk)
+      // Attach the result consumer before awaiting publication: early failures are never unhandled.
+      const result = handle.result.then(decode, error => {
+        if (error.kind === 'aborted') return { output: [], stopReason: 'aborted' }
+        if (error.kind === 'output_limit') return failure('any-a2a: CLI stdout exceeded maxOutputBytes or frame limit')
+        if (error.kind === 'protocol') return failure('any-a2a: invalid CLI response')
+        if (error.kind === 'timeout') return failure('any-a2a: CLI deadline exceeded; remote task may still be running')
+        return failure('any-a2a: CLI process failed')
       })
-      // Drain, but never retain or disclose stderr: it may contain wire payloads or secrets.
-      child.stderr.resume()
-      child.on('error', () => { processError = true })
-      const result = new Promise(resolve => {
-        child.once('close', (code, signal) => {
-          closed = true
-          if (streaming) { consume(decoder.decode()); if (pending.trim()) invalidStream = true }
-          request.signal.removeEventListener('abort', abort)
-          if (aborted) resolve({ output: [], stopReason: 'aborted' })
-          else if (overflow) resolve(failure('any-a2a: CLI stdout exceeded maxOutputBytes'))
-          else if (processError || code !== 0 || signal !== null) resolve(failure('any-a2a: CLI process failed'))
-          else if (streaming) resolve(invalidStream || finalValue === undefined ? failure('any-a2a: invalid CLI event stream') : decode(JSON.stringify(finalValue)))
-          else resolve(decode(Buffer.concat(chunks).toString('utf8')))
-        })
-      })
-      request.signal.addEventListener('abort', abort, { once: true })
-      if (request.signal.aborted) abort()
       try {
-        await new Promise((resolve, reject) => {
-          child.once('spawn', resolve)
-          child.once('error', () => reject(new Error('any-a2a: could not spawn CLI executable')))
-        })
+        await handle.spawned
         request.signal.throwIfAborted()
       } catch (error) {
-        abort()
+        handle.stop()
         await result
+        if (error.kind === 'spawn') throw new Error('any-a2a: could not spawn CLI executable')
         throw error
       }
       return {
-        // Remote DSH identity, deliberately unrelated to the A2A task/context identifiers.
+        // Remote DSH identity, deliberately unrelated to A2A task/context IDs.
         id: /** @type {import('@deepseek-ai/dsh-session').SessionId} */ (`any-a2a:${randomUUID()}`),
         localAgent: undefined,
         result,
-        async dispose() { if (!closed) abort(); await result },
+        async dispose() { handle.stop(); await result },
       }
     },
   }

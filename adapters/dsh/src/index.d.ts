@@ -3,6 +3,8 @@ import type { SubagentProvider } from '@deepseek-ai/dsh-subagent'
 
 /** Configuration validated by apply, including when no schema-aware loader is used. */
 export interface Config {
+  /** Trusted static launcher arguments; never exposed as model-controlled input. */
+  args?: string[]
   /** HTTP(S) agent card URL, without embedded userinfo. */
   cardUrl?: string
   /** Absolute cached raw Agent Card JSON path; mutually exclusive with cardUrl. */

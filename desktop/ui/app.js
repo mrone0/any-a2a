@@ -22,6 +22,9 @@ function render() {
     list.append(empty);
   }
   for (const agent of agents) {
+    const info = agent.info;
+    const name = info?.name || agent.id;
+    const description = info ? info.description || '' : '未缓存卡片，运行时读取';
     const row = document.createElement('article');
     row.className = 'agent';
     // Only static markup: card names, IDs and descriptions are untrusted data.
@@ -30,18 +33,18 @@ function render() {
       <p class="agent-description"></p>
       <details class="agent-details"><summary>查看详情</summary><p></p><dl><dt>协议</dt><dd></dd><dt>服务地址</dt><dd class="endpoint"></dd></dl></details></div>
       <div class="agent-actions"><button class="agent-run" type="button">运行 <span aria-hidden="true">↗</span></button><button class="agent-delete" type="button">删除</button></div>`;
-    row.querySelector('.agent-avatar').textContent = Array.from(agent.info.name || 'A')[0].toUpperCase();
-    row.querySelector('strong').textContent = agent.info.name;
+    row.querySelector('.agent-avatar').textContent = Array.from(name || 'A')[0].toUpperCase();
+    row.querySelector('strong').textContent = name;
     row.querySelector('.source-badge').textContent = agent.source === 'url' ? 'URL' : '手动';
-    row.querySelector('.agent-description').textContent = agent.info.description;
-    row.querySelector('.agent-details p').textContent = agent.info.description;
-    row.querySelector('dd').textContent = `${agent.info.binding || 'JSONRPC'} · ${agent.info.version || '—'}`;
-    row.querySelector('.endpoint').textContent = agent.info.endpoint || '—';
+    row.querySelector('.agent-description').textContent = description;
+    row.querySelector('.agent-details p').textContent = info && agent.source === 'url' ? `${description}\n本地保存的卡片信息；远端可用性尚未检查。` : description;
+    row.querySelector('dd').textContent = info ? `${info.binding || 'JSONRPC'} · ${info.version || '—'}` : '未知 · 运行时读取卡片';
+    row.querySelector('.endpoint').textContent = info?.endpoint || agent.card_url || '—';
     row.querySelector('button').onclick = () => { view('run'); select.value = agent.id; updateRequestForm(); };
     row.querySelector('.agent-delete').onclick = () => {
       if (row.querySelector('.delete-confirm')) return;
       const panel = document.createElement('div'); panel.className = 'delete-confirm';
-      const text = document.createElement('p'); text.textContent = `删除「${agent.info.name}」？仅移除本地记录，不取消远端任务；历史配置和凭据不会被擦除。`;
+      const text = document.createElement('p'); text.textContent = `删除「${name}」？仅移除本地记录，不取消远端任务；历史配置和凭据不会被擦除。`;
       const confirm = document.createElement('button'); confirm.className = 'agent-delete'; confirm.textContent = '确认删除';
       const cancel = document.createElement('button'); cancel.className = 'secondary'; cancel.textContent = '取消';
       cancel.onclick = () => panel.remove();
@@ -58,9 +61,10 @@ function render() {
     list.append(row);
     const option = document.createElement('option');
     option.value = agent.id;
-    option.textContent = agent.info.name;
+    option.textContent = name;
     select.append(option);
   }
+  updateRequestForm();
 }
 document.querySelectorAll('[data-view]').forEach(x=>x.onclick=()=>view(x.dataset.view));document.querySelectorAll('[data-goto]').forEach(x=>x.onclick=()=>view(x.dataset.goto));document.querySelectorAll('[data-source]').forEach(x=>x.onclick=()=>{source=x.dataset.source;document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.source===source));$('url-field').hidden=source!=='url';$('manual-field').hidden=source!=='manual'})
 $('form').onsubmit=async e=>{e.preventDefault();$('save').disabled=true;showStatus('正在验证并保存…');try{const body={auth:{bearerToken:$('auth-token').value,headers:$('auth-headers').value.trim()?JSON.parse($('auth-headers').value):{}}};if(source==='url')body.cardUrl=$('url').value.trim();else body.agentCard=JSON.parse($('card').value);const r=await api(body);if(r.error)throw Error(r.error);if(!r||typeof r!=='object')throw Error('保存返回异常');showStatus('已保存',true);$('auth-token').value='';$('auth-headers').value='';await load();view('agents')}catch(e){showStatus(`保存失败：${e.message}`)}finally{$('save').disabled=false}}
@@ -170,15 +174,16 @@ function renderClientEntrances() {
 }
 function updateRequestForm() {
   const agent = agents.find(a => a.id === $('run-agent').value);
-  const version = agent?.info.version;
-  $('request-version').textContent = version ? `A2A ${version}` : '未选择 Agent';
-  $('mode-label').textContent = version === '1.0' ? 'returnImmediately · 立即返回任务' : 'blocking · 等待任务结果';
+  const version = agent?.info?.version;
+  $('request-version').textContent = version ? `A2A ${version}` : agent ? '协议未知，运行时读取卡片' : '未选择 Agent';
+  $('mode-label').textContent = version === '1.0' ? 'returnImmediately · 立即返回任务' : version ? 'blocking · 等待任务结果' : '卡片未缓存，使用远端协议的默认模式';
+  $('request-mode').disabled = !version;
   $('request-mode').value = 'default'; $('history-length').value = ''; $('output-modes').value = '';
 }
 function requestConfiguration() {
-  const version = agents.find(a => a.id === $('run-agent').value)?.info.version;
+  const version = agents.find(a => a.id === $('run-agent').value)?.info?.version;
   const config = {};
-  if ($('request-mode').value !== 'default') config[version === '1.0' ? 'returnImmediately' : 'blocking'] = $('request-mode').value === 'true';
+  if (version && $('request-mode').value !== 'default') config[version === '1.0' ? 'returnImmediately' : 'blocking'] = $('request-mode').value === 'true';
   if ($('history-length').value !== '') config.historyLength = Number($('history-length').value);
   if ($('output-modes').value.trim()) config.acceptedOutputModes = $('output-modes').value.split(',').map(s => s.trim()).filter(Boolean);
   return config;

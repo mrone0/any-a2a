@@ -2,7 +2,7 @@
 
 **any-a2a** 是一个面向客户端的开源远程 Subagent 委派工具：它把本地客户端中的一次委派请求，通过 Rust CLI 转换为 A2A（Agent2Agent）协议请求，发送给远端 Agent，再将结果安全地带回原客户端。
 
-> 当前版本：`0.1.0`
+> 当前版本：`0.1.1`
 >
 > 本项目仍处于可行性验证阶段。它不是完整的 A2A 平台，也不是 LLM provider；桌面端主要负责配置、目录管理和测试，真正的任务执行由调用它的客户端和 Rust CLI 负责。
 
@@ -62,6 +62,7 @@ CLI 是独立的执行边界：桌面 App 退出不会中断客户端自己启�
 - 支持直接 Message 结果和 Task 轮询，读取文本 artifact 与状态消息。
 - 支持 Bearer token；HTTP 重定向禁用，Card 与实际 endpoint 必须同源。
 - 对 HTTP 请求、响应体、CLI 输出、进度和持久化记录设置大小/时间上限。
+- 单次 HTTP 响应最多 4 MiB；一次 CLI 调用累计响应最多 64 MiB、1024 次 RPC。进度按 UTF-8 边界裁剪，stdout 最多保留 2 MiB / 512 条进度事件；达到进度预算后继续收集最终结果，并明确标记截断。最终 CLI JSON 最多 16 MiB，适配器默认总 stdout 预算为 20 MiB，原始最终 Message/Task 在这个上限内完整保留。
 - 远端状态、进度和最终输出均视为不可信数据，不会根据远端输出自动执行本地工具。
 - A2A 1.0 仅实现 JSON-RPC 绑定的核心操作；不支持 `SendStreamingMessage`/`SubscribeToTask`（SSE 流式）、`ListTasks`、push notification、gRPC 与 HTTP+REST 绑定、OAuth、多模态文件传输、任务恢复和双向补充输入。
 - `input-required` / `auth-required` 会明确报错，不会伪装成完成。
@@ -70,7 +71,7 @@ CLI 是独立的执行边界：桌面 App 退出不会中断客户端自己启�
 
 ## 构建与检查
 
-需要 Rust stable（Edition 2024）。
+需要 Rust 1.89 或更高版本（Edition 2024）。
 
 ```sh
 cargo build --release
@@ -91,6 +92,8 @@ cargo build --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
 上述命令构建本地调试程序，不生成安装包。Windows 资源文件 `desktop/src-tauri/icons/icon.ico` 已随源码提交。
+
+桌面程序内嵌 Pi、DSH 适配器及公共运行文件，安装后接入客户端无需保留源码仓库。桌面启动时统一选择安装目录中的 CLI；本地调试构建也可使用项目的 debug/release CLI，或通过 `ANY_A2A_EXECUTABLE` 指定原生可执行文件。接入时将适配器和 CLI 复制到本地数据目录下的内容摘要版本目录，已有版本不会被覆盖，客户端可以在桌面退出后独立执行。每种适配器最多保留 32 个版本；清理旧版本前请停止使用该版本的客户端并核对配置引用。
 
 ## CLI 使用
 
@@ -125,7 +128,9 @@ export ANY_A2A_TOKEN='your-token'
 client → any-a2a run --agent-id ID → remote Agent
 ```
 
-`--agent-id` 从本地目录读取 Agent 和认证信息；`any-a2a catalog` 输出不含认证字段的 Agent 目录。已有 `serviceUrl/serviceToken` 配置不会自动迁移，迁移前请备份并只移除旧的 any-a2a 配置项。
+`--agent-id` 从本地目录读取 Agent 和认证信息；`any-a2a catalog` 输出不含认证字段的 Agent 目录。列表只读取本地保存的元数据，不检查远端在线状态；旧 URL 记录没有缓存时仍保留，执行时只读取选中 Agent 的当前 Card。详见 [目录与缓存规则](docs/catalog.md)。已有 `serviceUrl/serviceToken` 配置不会自动迁移，迁移前请备份并只移除旧的 any-a2a 配置项。
+
+目录文件统一使用有界的 JSONL 解析和保存规则，支持空白行与 CRLF，总大小上限为 8 MiB。桌面内置编辑器、新增和删除均使用同一个跨进程文件锁，整份快照原子替换；编辑保存会保留原文备份，并拒绝覆盖已经变化的文件。锁文件由操作系统管理，异常退出后无需删除。外部文本编辑器不参与这个锁；使用外部编辑器时请先停止桌面和其他目录写入程序。
 
 ## 客户端适配层
 
@@ -143,13 +148,15 @@ DSH 的安装与验证说明见 [adapters/dsh](adapters/dsh/README.md)；Pi 的�
 
 - 本地 abort、超时或杀死 CLI 只停止本地等待，不自动取消远端工作。
 - A2A 远端取消只能在已取得任务 ID 后通过 `CancelTask`（A2A 1.0）或 `tasks/cancel`（A2A 0.3.0）请求，并以远端确认的 `canceled` 状态为准。
-- 本地 API 的 `POST /api/run` 支持唯一 `runId`，`POST /api/cancel` 只表示本地接受取消意图；最终状态以运行结果为准。
+- 本地 API 的 `POST /api/run` 在读取目录和连接前登记唯一 `runId`，退出时释放登记。`POST /api/cancel` 只表示本地接受取消意图；Card 请求须先返回，连接期间收到的取消会阻止发送任务。已提交任务的远端取消仍以运行结果为准。服务最多处理 8 个普通请求，并为取消保留 4 个独立工作线程。
 - 运行记录与客户端 parent session 关联；恢复时不会重新提交任务。崩溃期间的中间进度不保证持久化。
 - 适配层会限制输出、并发、记录数量和进程生命周期；完整的有界结果保存在 tool details 或运行记录中，模型上下文只接收可读摘要。
 
 ## 验证范围
 
 Rust 测试使用本地 HTTP fixture 验证真实 HTTP/JSON-RPC 编解码，包括直接结果、长任务轮询、暂停状态、跨源拒绝和版本拒绝。客户端测试还覆盖真实 CLI、认证隔离、进度、结果、abort、reload、缺失 Agent 和异常输出。
+
+`0.1.1` 还通过仓库的 `tests/manual-agent.mjs` 复验原生 Windows CLI、Pi `0.85.1` 前台和后台委派。三项均从 `working` 到 `completed`，每项 RPC 日志包含一次 `message/send` 和 36 次 `tasks/get`，原始结果保留完整输入回显；Pi 后台完成通知只发送一次，跨会话读取和停止被拒绝。此 Agent 返回明确标注的固定模拟数据，这些检查未调用真实模型，也不代替 TUI 验收。
 
 本地 fixture 不等于第三方服务兼容性认证。真实模型会话、真实远端 Agent、客户端完整 UI、Windows 安装包和跨客户端任务恢复仍需在目标环境单独验收。上游 DSH 参考源码位于 `.research/deepseek-harness`（gitignored），使用的固定检查版本及限制见 [DSH adapter 文档](adapters/dsh/README.md)。
 

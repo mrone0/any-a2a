@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::{
     io::{BufRead, BufReader},
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
 };
@@ -8,8 +9,8 @@ use tauri::Manager;
 #[path = "../../../adapters/dsh/desktop/apply.rs"]
 mod apply_dsh;
 mod clients;
-#[path = "../../../adapters/pi/deploy.rs"]
-mod pi_deploy;
+mod deployment;
+mod pi_host;
 mod setup_command;
 use apply_dsh::apply_dsh;
 #[path = "../../../adapters/dsh/desktop/discovery.rs"]
@@ -24,26 +25,19 @@ struct Connection {
     address: String,
     token: String,
 }
+struct RuntimePaths {
+    executable: PathBuf,
+    data: PathBuf,
+}
 
-fn start_service(token: &str) -> Result<Child, String> {
-    let executable = std::env::var("ANY_A2A_EXECUTABLE").unwrap_or_else(|_| {
-        let name = format!("any-a2a{}", std::env::consts::EXE_SUFFIX);
-        if let Some(parent) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        {
-            let bundled = parent.join(&name);
-            if bundled.is_file() {
-                return bundled.to_string_lossy().into_owned();
-            }
-        }
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
-            .join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX))
-            .to_string_lossy()
-            .into_owned()
-    });
-    Command::new(executable)
+fn start_service(executable: &Path, token: &str) -> Result<Child, String> {
+    let mut command = Command::new(executable);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
         .arg("serve")
         .env("ANY_A2A_SERVICE_TOKEN", token)
         .stdout(Stdio::piped())
@@ -136,28 +130,15 @@ async fn cards_api(
 }
 
 #[tauri::command]
-fn pi_setup() -> Result<serde_json::Value, String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let extension = root
-        .join("adapters/pi/index.ts")
-        .canonicalize()
-        .map_err(|_| "Pi 扩展文件不存在；当前需要保留源码目录")?;
-    let executable = std::env::var_os("ANY_A2A_EXECUTABLE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            root.join("target/debug")
-                .join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX))
-        });
-    if !executable.is_file() {
-        return Err("CLI 不存在，请先在项目根目录 cargo build".into());
-    }
-    let executable = executable
-        .canonicalize()
-        .map_err(|_| "Cannot resolve CLI")?;
-    let data_dir = any_a2a::catalog::data_dir()?;
+fn pi_setup(paths: tauri::State<'_, RuntimePaths>) -> Result<serde_json::Value, String> {
+    let package = deployment::stage("pi", &paths.data, &paths.executable)?;
+    let extension = package.join("index.ts");
+    let executable = package
+        .join("bin")
+        .join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX));
     let (shell, command) = setup_command::pi_command(
         &executable.to_string_lossy(),
-        &data_dir.to_string_lossy(),
+        &paths.data.to_string_lossy(),
         &extension.to_string_lossy(),
         cfg!(target_os = "windows"),
     );
@@ -167,16 +148,8 @@ fn pi_setup() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn pi_install() -> Result<serde_json::Value, String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let data = any_a2a::catalog::data_dir()?;
-    let executable = std::env::var_os("ANY_A2A_EXECUTABLE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            root.join("target/release")
-                .join(format!("any-a2a{}", std::env::consts::EXE_SUFFIX))
-        });
-    let extension = pi_deploy::stage(&root, &data, &executable)?;
+fn pi_install(paths: tauri::State<'_, RuntimePaths>) -> Result<serde_json::Value, String> {
+    let extension = deployment::stage("pi", &paths.data, &paths.executable)?;
     let home = std::env::var_os("PI_CODING_AGENT_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -192,7 +165,7 @@ fn pi_install() -> Result<serde_json::Value, String> {
         )
         .map_err(|_| "Cannot back up Pi settings")?;
     }
-    let output = Command::new("pi")
+    let output = pi_host::install_command()?
         .arg("install")
         .arg(&extension)
         .output()
@@ -230,7 +203,14 @@ fn main() {
         ])
         .setup(|app| {
             let token = uuid::Uuid::new_v4().to_string();
-            let mut child = start_service(&token).map_err(std::io::Error::other)?;
+            let data = any_a2a::catalog::data_dir().map_err(std::io::Error::other)?;
+            std::fs::create_dir_all(&data)?;
+            let paths = RuntimePaths {
+                executable: deployment::executable().map_err(std::io::Error::other)?,
+                data: data.canonicalize()?,
+            };
+            let mut child =
+                start_service(&paths.executable, &token).map_err(std::io::Error::other)?;
             let stdout = child
                 .stdout
                 .take()
@@ -241,6 +221,7 @@ fn main() {
                 .ok_or_else(|| std::io::Error::other("service did not publish address"))?
                 .map_err(std::io::Error::other)?;
             app.manage(Connection { address, token });
+            app.manage(paths);
             app.state::<Service>()
                 .0
                 .lock()

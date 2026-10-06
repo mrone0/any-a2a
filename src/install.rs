@@ -49,12 +49,13 @@ pub fn install_dsh(ids: Vec<String>, config_path: &str) -> Result<Value> {
             .iter()
             .find(|a| a.id == id)
             .ok_or("Selected agent is no longer in the catalog")?;
-        crate::inspect_card(&agent.raw)?;
+        let raw = agent.raw.as_ref().ok_or("Selected Agent has no saved Card metadata; add its URL explicitly to cache the Card before installation")?;
+        crate::inspect_card(raw)?;
         let card = dir.join("cards").join(format!("{id}.json"));
         let bytes = read_regular(&card)?;
         let cached: Value =
             serde_json::from_slice(&bytes).map_err(|_| "Cached card is invalid JSON")?;
-        if cached != agent.raw {
+        if &cached != raw {
             return Err(
                 "Cached card differs from catalog; re-import explicitly before installation".into(),
             );
